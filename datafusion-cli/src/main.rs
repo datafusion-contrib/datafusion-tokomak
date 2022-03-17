@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use clap::{crate_version, Command, Parser, Arg};
+use clap::{crate_version, Arg, Command, Parser};
 use datafusion::error::Result;
 use datafusion::execution::context::ExecutionConfig;
 use datafusion_cli::print_format::all_print_formats;

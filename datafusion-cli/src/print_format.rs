@@ -18,10 +18,10 @@
 //! Print format variants
 use arrow::csv::writer::WriterBuilder;
 use arrow::json::{ArrayWriter, LineDelimitedWriter};
+use core::fmt;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::pretty;
 use datafusion::error::{DataFusionError, Result};
-use core::fmt;
 use std::str::FromStr;
 
 /// Allow records to be printed in different formats
@@ -44,7 +44,6 @@ pub fn all_print_formats() -> Vec<PrintFormat> {
         PrintFormat::NdJson,
     ]
 }
-
 
 impl fmt::Display for PrintFormat {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
