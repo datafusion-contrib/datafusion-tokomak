@@ -40,6 +40,7 @@ use super::{
     RecordBatchStream, SendableRecordBatchStream, Statistics,
 };
 
+use crate::execution::runtime_env::RuntimeEnv;
 use async_trait::async_trait;
 
 /// Limit execution plan
@@ -113,7 +114,11 @@ impl ExecutionPlan for GlobalLimitExec {
         }
     }
 
-    async fn execute(&self, partition: usize) -> Result<SendableRecordBatchStream> {
+    async fn execute(
+        &self,
+        partition: usize,
+        runtime: Arc<RuntimeEnv>,
+    ) -> Result<SendableRecordBatchStream> {
         // GlobalLimitExec has a single output partition
         if 0 != partition {
             return Err(DataFusionError::Internal(format!(
@@ -130,7 +135,7 @@ impl ExecutionPlan for GlobalLimitExec {
         }
 
         let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
-        let stream = self.input.execute(0).await?;
+        let stream = self.input.execute(0, runtime).await?;
         Ok(Box::pin(LimitStream::new(
             stream,
             self.limit,
@@ -242,9 +247,13 @@ impl ExecutionPlan for LocalLimitExec {
         }
     }
 
-    async fn execute(&self, partition: usize) -> Result<SendableRecordBatchStream> {
+    async fn execute(
+        &self,
+        partition: usize,
+        runtime: Arc<RuntimeEnv>,
+    ) -> Result<SendableRecordBatchStream> {
         let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
-        let stream = self.input.execute(partition).await?;
+        let stream = self.input.execute(partition, runtime).await?;
         Ok(Box::pin(LimitStream::new(
             stream,
             self.limit,
@@ -387,27 +396,31 @@ mod tests {
     use crate::datasource::object_store::local::LocalFileSystem;
     use crate::physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use crate::physical_plan::common;
-    use crate::physical_plan::file_format::CsvExec;
-    use crate::test;
+    use crate::physical_plan::file_format::{CsvExec, PhysicalPlanConfig};
+    use crate::{test, test_util};
 
     #[tokio::test]
     async fn limit() -> Result<()> {
-        let schema = test::aggr_test_schema();
+        let runtime = Arc::new(RuntimeEnv::default());
+        let schema = test_util::aggr_test_schema();
 
         let num_partitions = 4;
         let (_, files) =
             test::create_partitioned_csv("aggregate_test_100.csv", num_partitions)?;
 
         let csv = CsvExec::new(
-            Arc::new(LocalFileSystem {}),
-            files,
-            Statistics::default(),
-            schema,
+            PhysicalPlanConfig {
+                object_store: Arc::new(LocalFileSystem {}),
+                file_schema: schema,
+                file_groups: files,
+                statistics: Statistics::default(),
+                projection: None,
+                batch_size: 1024,
+                limit: None,
+                table_partition_cols: vec![],
+            },
             true,
             b',',
-            None,
-            1024,
-            None,
         );
 
         // input should have 4 partitions
@@ -417,7 +430,7 @@ mod tests {
             GlobalLimitExec::new(Arc::new(CoalescePartitionsExec::new(Arc::new(csv))), 7);
 
         // the result should contain 4 batches (one per input partition)
-        let iter = limit.execute(0).await?;
+        let iter = limit.execute(0, runtime).await?;
         let batches = common::collect(iter).await?;
 
         // there should be a total of 100 rows

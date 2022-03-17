@@ -42,6 +42,7 @@ use crate::datasource::{create_max_min_accs, get_col_stats};
 use crate::error::DataFusionError;
 use crate::error::Result;
 use crate::logical_plan::combine_filters;
+use crate::logical_plan::Expr;
 use crate::physical_plan::expressions::{MaxAccumulator, MinAccumulator};
 use crate::physical_plan::file_format::ParquetExec;
 use crate::physical_plan::ExecutionPlan;
@@ -92,38 +93,30 @@ impl FileFormat for ParquetFormat {
             .next()
             .await
             .ok_or_else(|| DataFusionError::Plan("No data file found".to_owned()))??;
-        let (schema, _) = fetch_metadata(first_file)?;
+        let schema = fetch_schema(first_file)?;
         Ok(Arc::new(schema))
     }
 
     async fn infer_stats(&self, reader: Arc<dyn ObjectReader>) -> Result<Statistics> {
-        let (_, stats) = fetch_metadata(reader)?;
+        let stats = fetch_statistics(reader)?;
         Ok(stats)
     }
 
     async fn create_physical_plan(
         &self,
         conf: PhysicalPlanConfig,
+        filters: &[Expr],
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // If enable pruning then combine the filters to build the predicate.
         // If disable pruning then set the predicate to None, thus readers
         // will not prune data based on the statistics.
         let predicate = if self.enable_pruning {
-            combine_filters(&conf.filters)
+            combine_filters(filters)
         } else {
             None
         };
 
-        Ok(Arc::new(ParquetExec::new(
-            conf.object_store,
-            conf.files,
-            conf.statistics,
-            conf.schema,
-            conf.projection,
-            predicate,
-            conf.batch_size,
-            conf.limit,
-        )))
+        Ok(Arc::new(ParquetExec::new(conf, predicate)))
     }
 }
 
@@ -249,8 +242,18 @@ fn summarize_min_max(
     }
 }
 
-/// Read and parse the metadata of the Parquet file at location `path`
-fn fetch_metadata(object_reader: Arc<dyn ObjectReader>) -> Result<(Schema, Statistics)> {
+/// Read and parse the schema of the Parquet file at location `path`
+fn fetch_schema(object_reader: Arc<dyn ObjectReader>) -> Result<Schema> {
+    let obj_reader = ChunkObjectReader(object_reader);
+    let file_reader = Arc::new(SerializedFileReader::new(obj_reader)?);
+    let mut arrow_reader = ParquetFileArrowReader::new(file_reader);
+    let schema = arrow_reader.get_schema()?;
+
+    Ok(schema)
+}
+
+/// Read and parse the statistics of the Parquet file at location `path`
+fn fetch_statistics(object_reader: Arc<dyn ObjectReader>) -> Result<Statistics> {
     let obj_reader = ChunkObjectReader(object_reader);
     let file_reader = Arc::new(SerializedFileReader::new(obj_reader)?);
     let mut arrow_reader = ParquetFileArrowReader::new(file_reader);
@@ -305,7 +308,7 @@ fn fetch_metadata(object_reader: Arc<dyn ObjectReader>) -> Result<(Schema, Stati
         is_exact: true,
     };
 
-    Ok((schema, statistics))
+    Ok(statistics)
 }
 
 /// A wrapper around the object reader to make it implement `ChunkReader`
@@ -330,17 +333,15 @@ impl ChunkReader for ChunkObjectReader {
 #[cfg(test)]
 mod tests {
     use crate::{
-        datasource::{
-            object_store::local::{
-                local_file_meta, local_object_reader, local_object_reader_stream,
-                LocalFileSystem,
-            },
-            PartitionedFile,
+        datasource::object_store::local::{
+            local_object_reader, local_object_reader_stream, local_unpartitioned_file,
+            LocalFileSystem,
         },
         physical_plan::collect,
     };
 
     use super::*;
+    use crate::execution::runtime_env::RuntimeEnv;
     use arrow::array::{
         BinaryArray, BooleanArray, Float32Array, Float64Array, Int32Array,
         TimestampNanosecondArray,
@@ -349,9 +350,10 @@ mod tests {
 
     #[tokio::test]
     async fn read_small_batches() -> Result<()> {
+        let runtime = Arc::new(RuntimeEnv::default());
         let projection = None;
         let exec = get_exec("alltypes_plain.parquet", &projection, 2, None).await?;
-        let stream = exec.execute(0).await?;
+        let stream = exec.execute(0, runtime).await?;
 
         let tt_batches = stream
             .map(|batch| {
@@ -373,6 +375,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_limit() -> Result<()> {
+        let runtime = Arc::new(RuntimeEnv::default());
         let projection = None;
         let exec = get_exec("alltypes_plain.parquet", &projection, 1024, Some(1)).await?;
 
@@ -380,7 +383,7 @@ mod tests {
         assert_eq!(exec.statistics().num_rows, Some(8));
         assert_eq!(exec.statistics().total_byte_size, Some(671));
         assert!(exec.statistics().is_exact);
-        let batches = collect(exec).await?;
+        let batches = collect(exec, runtime).await?;
         assert_eq!(1, batches.len());
         assert_eq!(11, batches[0].num_columns());
         assert_eq!(8, batches[0].num_rows());
@@ -390,6 +393,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_alltypes_plain_parquet() -> Result<()> {
+        let runtime = Arc::new(RuntimeEnv::default());
         let projection = None;
         let exec = get_exec("alltypes_plain.parquet", &projection, 1024, None).await?;
 
@@ -415,7 +419,7 @@ mod tests {
             y
         );
 
-        let batches = collect(exec).await?;
+        let batches = collect(exec, runtime).await?;
 
         assert_eq!(1, batches.len());
         assert_eq!(11, batches[0].num_columns());
@@ -426,10 +430,11 @@ mod tests {
 
     #[tokio::test]
     async fn read_bool_alltypes_plain_parquet() -> Result<()> {
+        let runtime = Arc::new(RuntimeEnv::default());
         let projection = Some(vec![1]);
         let exec = get_exec("alltypes_plain.parquet", &projection, 1024, None).await?;
 
-        let batches = collect(exec).await?;
+        let batches = collect(exec, runtime).await?;
         assert_eq!(1, batches.len());
         assert_eq!(1, batches[0].num_columns());
         assert_eq!(8, batches[0].num_rows());
@@ -454,10 +459,11 @@ mod tests {
 
     #[tokio::test]
     async fn read_i32_alltypes_plain_parquet() -> Result<()> {
+        let runtime = Arc::new(RuntimeEnv::default());
         let projection = Some(vec![0]);
         let exec = get_exec("alltypes_plain.parquet", &projection, 1024, None).await?;
 
-        let batches = collect(exec).await?;
+        let batches = collect(exec, runtime).await?;
         assert_eq!(1, batches.len());
         assert_eq!(1, batches[0].num_columns());
         assert_eq!(8, batches[0].num_rows());
@@ -479,10 +485,11 @@ mod tests {
 
     #[tokio::test]
     async fn read_i96_alltypes_plain_parquet() -> Result<()> {
+        let runtime = Arc::new(RuntimeEnv::default());
         let projection = Some(vec![10]);
         let exec = get_exec("alltypes_plain.parquet", &projection, 1024, None).await?;
 
-        let batches = collect(exec).await?;
+        let batches = collect(exec, runtime).await?;
         assert_eq!(1, batches.len());
         assert_eq!(1, batches[0].num_columns());
         assert_eq!(8, batches[0].num_rows());
@@ -504,10 +511,11 @@ mod tests {
 
     #[tokio::test]
     async fn read_f32_alltypes_plain_parquet() -> Result<()> {
+        let runtime = Arc::new(RuntimeEnv::default());
         let projection = Some(vec![6]);
         let exec = get_exec("alltypes_plain.parquet", &projection, 1024, None).await?;
 
-        let batches = collect(exec).await?;
+        let batches = collect(exec, runtime).await?;
         assert_eq!(1, batches.len());
         assert_eq!(1, batches[0].num_columns());
         assert_eq!(8, batches[0].num_rows());
@@ -532,10 +540,11 @@ mod tests {
 
     #[tokio::test]
     async fn read_f64_alltypes_plain_parquet() -> Result<()> {
+        let runtime = Arc::new(RuntimeEnv::default());
         let projection = Some(vec![7]);
         let exec = get_exec("alltypes_plain.parquet", &projection, 1024, None).await?;
 
-        let batches = collect(exec).await?;
+        let batches = collect(exec, runtime).await?;
         assert_eq!(1, batches.len());
         assert_eq!(1, batches[0].num_columns());
         assert_eq!(8, batches[0].num_rows());
@@ -560,10 +569,11 @@ mod tests {
 
     #[tokio::test]
     async fn read_binary_alltypes_plain_parquet() -> Result<()> {
+        let runtime = Arc::new(RuntimeEnv::default());
         let projection = Some(vec![9]);
         let exec = get_exec("alltypes_plain.parquet", &projection, 1024, None).await?;
 
-        let batches = collect(exec).await?;
+        let batches = collect(exec, runtime).await?;
         assert_eq!(1, batches.len());
         assert_eq!(1, batches[0].num_columns());
         assert_eq!(8, batches[0].num_rows());
@@ -595,7 +605,7 @@ mod tests {
         let testdata = crate::test_util::parquet_test_data();
         let filename = format!("{}/{}", testdata, file_name);
         let format = ParquetFormat::default();
-        let schema = format
+        let file_schema = format
             .infer_schema(local_object_reader_stream(vec![filename.clone()]))
             .await
             .expect("Schema inference");
@@ -603,20 +613,21 @@ mod tests {
             .infer_stats(local_object_reader(filename.clone()))
             .await
             .expect("Stats inference");
-        let files = vec![vec![PartitionedFile {
-            file_meta: local_file_meta(filename.clone()),
-        }]];
+        let file_groups = vec![vec![local_unpartitioned_file(filename.clone())]];
         let exec = format
-            .create_physical_plan(PhysicalPlanConfig {
-                object_store: Arc::new(LocalFileSystem {}),
-                schema,
-                files,
-                statistics,
-                projection: projection.clone(),
-                batch_size,
-                filters: vec![],
-                limit,
-            })
+            .create_physical_plan(
+                PhysicalPlanConfig {
+                    object_store: Arc::new(LocalFileSystem {}),
+                    file_schema,
+                    file_groups,
+                    statistics,
+                    projection: projection.clone(),
+                    batch_size,
+                    limit,
+                    table_partition_cols: vec![],
+                },
+                &[],
+            )
             .await?;
         Ok(exec)
     }

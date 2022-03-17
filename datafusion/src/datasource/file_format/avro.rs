@@ -25,11 +25,12 @@ use arrow::{self, datatypes::SchemaRef};
 use async_trait::async_trait;
 use futures::StreamExt;
 
-use super::{FileFormat, PhysicalPlanConfig};
+use super::FileFormat;
 use crate::avro_to_arrow::read_avro_schema_from_reader;
 use crate::datasource::object_store::{ObjectReader, ObjectReaderStream};
 use crate::error::Result;
-use crate::physical_plan::file_format::AvroExec;
+use crate::logical_plan::Expr;
+use crate::physical_plan::file_format::{AvroExec, PhysicalPlanConfig};
 use crate::physical_plan::ExecutionPlan;
 use crate::physical_plan::Statistics;
 
@@ -61,16 +62,9 @@ impl FileFormat for AvroFormat {
     async fn create_physical_plan(
         &self,
         conf: PhysicalPlanConfig,
+        _filters: &[Expr],
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let exec = AvroExec::new(
-            conf.object_store,
-            conf.files,
-            conf.statistics,
-            conf.schema,
-            conf.projection,
-            conf.batch_size,
-            conf.limit,
-        );
+        let exec = AvroExec::new(conf);
         Ok(Arc::new(exec))
     }
 }
@@ -79,17 +73,15 @@ impl FileFormat for AvroFormat {
 #[cfg(feature = "avro")]
 mod tests {
     use crate::{
-        datasource::{
-            object_store::local::{
-                local_file_meta, local_object_reader, local_object_reader_stream,
-                LocalFileSystem,
-            },
-            PartitionedFile,
+        datasource::object_store::local::{
+            local_object_reader, local_object_reader_stream, local_unpartitioned_file,
+            LocalFileSystem,
         },
         physical_plan::collect,
     };
 
     use super::*;
+    use crate::execution::runtime_env::RuntimeEnv;
     use arrow::array::{
         BinaryArray, BooleanArray, Float32Array, Float64Array, Int32Array,
         TimestampMicrosecondArray,
@@ -99,8 +91,9 @@ mod tests {
     #[tokio::test]
     async fn read_small_batches() -> Result<()> {
         let projection = None;
+        let runtime = Arc::new(RuntimeEnv::default());
         let exec = get_exec("alltypes_plain.avro", &projection, 2, None).await?;
-        let stream = exec.execute(0).await?;
+        let stream = exec.execute(0, runtime).await?;
 
         let tt_batches = stream
             .map(|batch| {
@@ -349,7 +342,7 @@ mod tests {
         let testdata = crate::test_util::arrow_test_data();
         let filename = format!("{}/avro/{}", testdata, file_name);
         let format = AvroFormat {};
-        let schema = format
+        let file_schema = format
             .infer_schema(local_object_reader_stream(vec![filename.clone()]))
             .await
             .expect("Schema inference");
@@ -357,20 +350,21 @@ mod tests {
             .infer_stats(local_object_reader(filename.clone()))
             .await
             .expect("Stats inference");
-        let files = vec![vec![PartitionedFile {
-            file_meta: local_file_meta(filename.to_owned()),
-        }]];
+        let file_groups = vec![vec![local_unpartitioned_file(filename.to_owned())]];
         let exec = format
-            .create_physical_plan(PhysicalPlanConfig {
-                object_store: Arc::new(LocalFileSystem {}),
-                schema,
-                files,
-                statistics,
-                projection: projection.clone(),
-                batch_size,
-                filters: vec![],
-                limit,
-            })
+            .create_physical_plan(
+                PhysicalPlanConfig {
+                    object_store: Arc::new(LocalFileSystem {}),
+                    file_schema,
+                    file_groups,
+                    statistics,
+                    projection: projection.clone(),
+                    batch_size,
+                    limit,
+                    table_partition_cols: vec![],
+                },
+                &[],
+            )
             .await?;
         Ok(exec)
     }

@@ -21,13 +21,16 @@ use crate::{
         catalog::{CatalogList, MemoryCatalogList},
         information_schema::CatalogWithInformationSchema,
     },
-    datasource::file_format::{
-        avro::AvroFormat,
-        csv::CsvFormat,
-        parquet::{ParquetFormat, DEFAULT_PARQUET_EXTENSION},
-        FileFormat,
-    },
     datasource::listing::{ListingOptions, ListingTable},
+    datasource::{
+        file_format::{
+            avro::AvroFormat,
+            csv::CsvFormat,
+            parquet::{ParquetFormat, DEFAULT_PARQUET_EXTENSION},
+            FileFormat,
+        },
+        MemTable,
+    },
     logical_plan::{PlanType, ToStringifiedPlan},
     optimizer::eliminate_limit::EliminateLimit,
     physical_optimizer::{
@@ -36,7 +39,6 @@ use crate::{
     },
 };
 use log::debug;
-use std::fs;
 use std::path::Path;
 use std::string::String;
 use std::sync::Arc;
@@ -44,6 +46,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::Mutex,
 };
+use std::{fs, time::Instant};
 
 use futures::{StreamExt, TryStreamExt};
 use tokio::task::{self, JoinHandle};
@@ -60,10 +63,10 @@ use crate::datasource::TableProvider;
 use crate::error::{DataFusionError, Result};
 use crate::execution::dataframe_impl::DataFrameImpl;
 use crate::logical_plan::{
-    FunctionRegistry, LogicalPlan, LogicalPlanBuilder, UNNAMED_TABLE,
+    CreateExternalTable, CreateMemoryTable, DropTable, FunctionRegistry, LogicalPlan,
+    LogicalPlanBuilder, UNNAMED_TABLE,
 };
 use crate::optimizer::common_subexpr_eliminate::CommonSubexprEliminate;
-use crate::optimizer::constant_folding::ConstantFolding;
 use crate::optimizer::filter_push_down::FilterPushDown;
 use crate::optimizer::limit_push_down::LimitPushDown;
 use crate::optimizer::optimizer::OptimizerRule;
@@ -73,6 +76,9 @@ use crate::physical_optimizer::coalesce_batches::CoalesceBatches;
 use crate::physical_optimizer::merge_exec::AddCoalescePartitionsExec;
 use crate::physical_optimizer::repartition::Repartition;
 
+use crate::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
+use crate::logical_plan::plan::Explain;
+use crate::optimizer::single_distinct_to_groupby::SingleDistinctToGroupBy;
 use crate::physical_plan::planner::DefaultPhysicalPlanner;
 use crate::physical_plan::udf::ScalarUDF;
 use crate::physical_plan::ExecutionPlan;
@@ -136,6 +142,12 @@ pub struct ExecutionContext {
     pub state: Arc<Mutex<ExecutionContextState>>,
 }
 
+impl Default for ExecutionContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ExecutionContext {
     /// Creates a new execution context using a default configuration.
     pub fn new() -> Self {
@@ -167,6 +179,9 @@ impl ExecutionContext {
                 .register_catalog(config.default_catalog.clone(), default_catalog);
         }
 
+        let runtime_env =
+            Arc::new(RuntimeEnv::new(config.runtime_config.clone()).unwrap());
+
         Self {
             state: Arc::new(Mutex::new(ExecutionContextState {
                 catalog_list,
@@ -176,6 +191,7 @@ impl ExecutionContext {
                 config,
                 execution_props: ExecutionProps::new(),
                 object_store_registry: Arc::new(ObjectStoreRegistry::new()),
+                runtime_env,
             })),
         }
     }
@@ -187,13 +203,13 @@ impl ExecutionContext {
     pub async fn sql(&mut self, sql: &str) -> Result<Arc<dyn DataFrame>> {
         let plan = self.create_logical_plan(sql)?;
         match plan {
-            LogicalPlan::CreateExternalTable {
+            LogicalPlan::CreateExternalTable(CreateExternalTable {
                 ref schema,
                 ref name,
                 ref location,
                 ref file_type,
                 ref has_header,
-            } => {
+            }) => {
                 let file_format = match file_type {
                     FileType::CSV => {
                         Ok(Arc::new(CsvFormat::default().with_has_header(*has_header))
@@ -221,7 +237,7 @@ impl ExecutionContext {
                         .unwrap()
                         .config
                         .target_partitions,
-                    partitions: vec![],
+                    table_partition_cols: vec![],
                 };
 
                 // TODO make schema in CreateExternalTable optional instead of empty
@@ -235,6 +251,34 @@ impl ExecutionContext {
                     .await?;
                 let plan = LogicalPlanBuilder::empty(false).build()?;
                 Ok(Arc::new(DataFrameImpl::new(self.state.clone(), &plan)))
+            }
+
+            LogicalPlan::CreateMemoryTable(CreateMemoryTable { name, input }) => {
+                let plan = self.optimize(&input)?;
+                let physical = Arc::new(DataFrameImpl::new(self.state.clone(), &plan));
+
+                let batches: Vec<_> = physical.collect_partitioned().await?;
+                let table = Arc::new(MemTable::try_new(
+                    Arc::new(plan.schema().as_ref().into()),
+                    batches,
+                )?);
+                self.register_table(name.as_str(), table)?;
+
+                let plan = LogicalPlanBuilder::empty(false).build()?;
+                Ok(Arc::new(DataFrameImpl::new(self.state.clone(), &plan)))
+            }
+
+            LogicalPlan::DropTable(DropTable { name, if_exist, .. }) => {
+                let returned = self.deregister_table(name.as_str())?;
+                if !if_exist && returned.is_none() {
+                    Err(DataFusionError::Execution(format!(
+                        "Memory table {:?} doesn't exist.",
+                        name
+                    )))
+                } else {
+                    let plan = LogicalPlanBuilder::empty(false).build()?;
+                    Ok(Arc::new(DataFrameImpl::new(self.state.clone(), &plan)))
+                }
             }
 
             plan => Ok(Arc::new(DataFrameImpl::new(
@@ -326,6 +370,14 @@ impl ExecutionContext {
             )
             .await?
             .build()?,
+        )))
+    }
+
+    /// Creates an empty DataFrame.
+    pub fn read_empty(&self) -> Result<Arc<dyn DataFrame>> {
+        Ok(Arc::new(DataFrameImpl::new(
+            self.state.clone(),
+            &LogicalPlanBuilder::empty(true).build()?,
         )))
     }
 
@@ -442,7 +494,7 @@ impl ExecutionContext {
             collect_stat: true,
             file_extension: DEFAULT_PARQUET_EXTENSION.to_owned(),
             target_partitions,
-            partitions: vec![],
+            table_partition_cols: vec![],
         };
 
         self.register_listing_table(name, uri, listing_options, None)
@@ -611,28 +663,23 @@ impl ExecutionContext {
 
     /// Optimizes the logical plan by applying optimizer rules.
     pub fn optimize(&self, plan: &LogicalPlan) -> Result<LogicalPlan> {
-        if let LogicalPlan::Explain {
-            verbose,
-            plan,
-            stringified_plans,
-            schema,
-        } = plan
-        {
-            let mut stringified_plans = stringified_plans.clone();
+        if let LogicalPlan::Explain(e) = plan {
+            let mut stringified_plans = e.stringified_plans.clone();
 
             // optimize the child plan, capturing the output of each optimizer
-            let plan = self.optimize_internal(plan, |optimized_plan, optimizer| {
-                let optimizer_name = optimizer.name().to_string();
-                let plan_type = PlanType::OptimizedLogicalPlan { optimizer_name };
-                stringified_plans.push(optimized_plan.to_stringified(plan_type));
-            })?;
+            let plan =
+                self.optimize_internal(e.plan.as_ref(), |optimized_plan, optimizer| {
+                    let optimizer_name = optimizer.name().to_string();
+                    let plan_type = PlanType::OptimizedLogicalPlan { optimizer_name };
+                    stringified_plans.push(optimized_plan.to_stringified(plan_type));
+                })?;
 
-            Ok(LogicalPlan::Explain {
-                verbose: *verbose,
+            Ok(LogicalPlan::Explain(Explain {
+                verbose: e.verbose,
                 plan: Arc::new(plan),
                 stringified_plans,
-                schema: schema.clone(),
-            })
+                schema: e.schema.clone(),
+            }))
         } else {
             self.optimize_internal(plan, |_, _| {})
         }
@@ -671,6 +718,7 @@ impl ExecutionContext {
         let path = path.as_ref();
         // create directory to contain the CSV files (one per partition)
         let fs_path = Path::new(path);
+        let runtime = self.state.lock().unwrap().runtime_env.clone();
         match fs::create_dir(fs_path) {
             Ok(()) => {
                 let mut tasks = vec![];
@@ -680,7 +728,7 @@ impl ExecutionContext {
                     let path = fs_path.join(&filename);
                     let file = fs::File::create(path)?;
                     let mut writer = csv::Writer::new(file);
-                    let stream = plan.execute(i).await?;
+                    let stream = plan.execute(i, runtime.clone()).await?;
                     let handle: JoinHandle<Result<()>> = task::spawn(async move {
                         stream
                             .map(|batch| writer.write(&batch?))
@@ -710,6 +758,7 @@ impl ExecutionContext {
         let path = path.as_ref();
         // create directory to contain the Parquet files (one per partition)
         let fs_path = Path::new(path);
+        let runtime = self.state.lock().unwrap().runtime_env.clone();
         match fs::create_dir(fs_path) {
             Ok(()) => {
                 let mut tasks = vec![];
@@ -723,7 +772,7 @@ impl ExecutionContext {
                         plan.schema(),
                         writer_properties.clone(),
                     )?;
-                    let stream = plan.execute(i).await?;
+                    let stream = plan.execute(i, runtime.clone()).await?;
                     let handle: JoinHandle<Result<()>> = task::spawn(async move {
                         stream
                             .map(|batch| writer.write(&batch?))
@@ -762,9 +811,17 @@ impl ExecutionContext {
 
         let mut new_plan = plan.clone();
         debug!("Logical plan:\n {:?}", plan);
+        let mut execution_times = Vec::with_capacity(optimizers.len());
         for optimizer in optimizers {
+            let start = Instant::now();
             new_plan = optimizer.optimize(&new_plan, execution_props)?;
+            let duration = start.elapsed();
+            execution_times.push((optimizer.name(), duration));
             observer(&new_plan, optimizer.as_ref());
+        }
+
+        for (name, duration) in &execution_times {
+            debug!("[{}]={}us", name, duration.as_micros());
         }
         debug!("Optimized logical plan:\n {:?}", new_plan);
         Ok(new_plan)
@@ -851,6 +908,8 @@ pub struct ExecutionConfig {
     pub repartition_windows: bool,
     /// Should Datafusion parquet reader using the predicate to prune data
     parquet_pruning: bool,
+    /// Runtime configurations such as memory threshold and local disk for spill
+    pub runtime_config: RuntimeConfig,
 }
 
 impl Default for ExecutionConfig {
@@ -859,13 +918,15 @@ impl Default for ExecutionConfig {
             target_partitions: num_cpus::get(),
             batch_size: 8192,
             optimizers: vec![
-                Arc::new(ConstantFolding::new()),
+                // Simplify expressions first to maximize the chance
+                // of applying other optimizations
+                Arc::new(SimplifyExpressions::new()),
                 Arc::new(CommonSubexprEliminate::new()),
                 Arc::new(EliminateLimit::new()),
                 Arc::new(ProjectionPushDown::new()),
                 Arc::new(FilterPushDown::new()),
-                Arc::new(SimplifyExpressions::new()),
                 Arc::new(LimitPushDown::new()),
+                Arc::new(SingleDistinctToGroupBy::new()),
             ],
             physical_optimizers: vec![
                 Arc::new(AggregateStatistics::new()),
@@ -883,6 +944,7 @@ impl Default for ExecutionConfig {
             repartition_aggregations: true,
             repartition_windows: true,
             parquet_pruning: true,
+            runtime_config: RuntimeConfig::default(),
         }
     }
 }
@@ -891,15 +953,6 @@ impl ExecutionConfig {
     /// Create an execution config with default setting
     pub fn new() -> Self {
         Default::default()
-    }
-
-    /// Deprecated. Use with_target_partitions instead.
-    #[deprecated(
-        since = "5.1.0",
-        note = "This method is deprecated in favor of `with_target_partitions`."
-    )]
-    pub fn with_concurrency(self, n: usize) -> Self {
-        self.with_target_partitions(n)
     }
 
     /// Customize target_partitions
@@ -926,7 +979,6 @@ impl ExecutionConfig {
         self.query_planner = query_planner;
         self
     }
-
     /// Replace the optimizer rules
     pub fn with_optimizer_rules(
         mut self,
@@ -1009,6 +1061,12 @@ impl ExecutionConfig {
         self.parquet_pruning = enabled;
         self
     }
+
+    /// Customize runtime config
+    pub fn with_runtime_config(mut self, config: RuntimeConfig) -> Self {
+        self.runtime_config = config;
+        self
+    }
 }
 
 /// Holds per-execution properties and data (such as starting timestamps, etc).
@@ -1018,6 +1076,27 @@ impl ExecutionConfig {
 #[derive(Clone)]
 pub struct ExecutionProps {
     pub(crate) query_execution_start_time: DateTime<Utc>,
+}
+
+impl Default for ExecutionProps {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ExecutionProps {
+    /// Creates a new execution props
+    pub fn new() -> Self {
+        ExecutionProps {
+            query_execution_start_time: chrono::Utc::now(),
+        }
+    }
+
+    /// Marks the execution of query started timestamp
+    pub fn start_execution(&mut self) -> &Self {
+        self.query_execution_start_time = chrono::Utc::now();
+        &*self
+    }
 }
 
 /// Execution context for registering data sources and executing queries
@@ -1037,20 +1116,13 @@ pub struct ExecutionContextState {
     pub execution_props: ExecutionProps,
     /// Object Store that are registered with the context
     pub object_store_registry: Arc<ObjectStoreRegistry>,
+    /// Runtime environment
+    pub runtime_env: Arc<RuntimeEnv>,
 }
 
-impl ExecutionProps {
-    /// Creates a new execution props
-    pub fn new() -> Self {
-        ExecutionProps {
-            query_execution_start_time: chrono::Utc::now(),
-        }
-    }
-
-    /// Marks the execution of query started timestamp
-    pub fn start_execution(&mut self) -> &Self {
-        self.query_execution_start_time = chrono::Utc::now();
-        &*self
+impl Default for ExecutionContextState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1065,6 +1137,7 @@ impl ExecutionContextState {
             config: ExecutionConfig::new(),
             execution_props: ExecutionProps::new(),
             object_store_registry: Arc::new(ObjectStoreRegistry::new()),
+            runtime_env: Arc::new(RuntimeEnv::default()),
         }
     }
 
@@ -1148,6 +1221,8 @@ impl FunctionRegistry for ExecutionContextState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logical_plan::plan::Projection;
+    use crate::logical_plan::TableScan;
     use crate::logical_plan::{binary_expr, lit, Operator};
     use crate::physical_plan::functions::{make_scalar_function, Volatility};
     use crate::physical_plan::{collect, collect_partitioned};
@@ -1190,33 +1265,28 @@ mod tests {
             .build()
             .unwrap();
 
-        if let LogicalPlan::Explain {
-            stringified_plans, ..
-        } = &plan
-        {
-            assert_eq!(stringified_plans.len(), 1);
+        if let LogicalPlan::Explain(e) = &plan {
+            assert_eq!(e.stringified_plans.len(), 1);
         } else {
             panic!("plan was not an explain: {:?}", plan);
         }
 
         // now optimize the plan and expect to see more plans
         let optimized_plan = ExecutionContext::new().optimize(&plan).unwrap();
-        if let LogicalPlan::Explain {
-            stringified_plans, ..
-        } = &optimized_plan
-        {
+        if let LogicalPlan::Explain(e) = &optimized_plan {
             // should have more than one plan
             assert!(
-                stringified_plans.len() > 1,
+                e.stringified_plans.len() > 1,
                 "plans: {:#?}",
-                stringified_plans
+                e.stringified_plans
             );
             // should have at least one optimized plan
-            let opt = stringified_plans
+            let opt = e
+                .stringified_plans
                 .iter()
                 .any(|p| matches!(p.plan_type, PlanType::OptimizedLogicalPlan { .. }));
 
-            assert!(opt, "plans: {:#?}", stringified_plans);
+            assert!(opt, "plans: {:#?}", e.stringified_plans);
         } else {
             panic!("plan was not an explain: {:?}", plan);
         }
@@ -1334,7 +1404,8 @@ mod tests {
 
         let physical_plan = ctx.create_physical_plan(&logical_plan).await?;
 
-        let results = collect_partitioned(physical_plan).await?;
+        let runtime = ctx.state.lock().unwrap().runtime_env.clone();
+        let results = collect_partitioned(physical_plan, runtime).await?;
 
         // note that the order of partitions is not deterministic
         let mut num_rows = 0;
@@ -1382,6 +1453,7 @@ mod tests {
         let tmp_dir = TempDir::new()?;
         let partition_count = 4;
         let ctx = create_ctx(&tmp_dir, partition_count).await?;
+        let runtime = ctx.state.lock().unwrap().runtime_env.clone();
 
         let table = ctx.table("test")?;
         let logical_plan = LogicalPlanBuilder::from(table.to_logical_plan())
@@ -1390,12 +1462,12 @@ mod tests {
 
         let optimized_plan = ctx.optimize(&logical_plan)?;
         match &optimized_plan {
-            LogicalPlan::Projection { input, .. } => match &**input {
-                LogicalPlan::TableScan {
+            LogicalPlan::Projection(Projection { input, .. }) => match &**input {
+                LogicalPlan::TableScan(TableScan {
                     source,
                     projected_schema,
                     ..
-                } => {
+                }) => {
                     assert_eq!(source.schema().fields().len(), 3);
                     assert_eq!(projected_schema.fields().len(), 1);
                 }
@@ -1413,7 +1485,7 @@ mod tests {
         assert_eq!(1, physical_plan.schema().fields().len());
         assert_eq!("c2", physical_plan.schema().field(0).name().as_str());
 
-        let batches = collect(physical_plan).await?;
+        let batches = collect(physical_plan, runtime).await?;
         assert_eq!(40, batches.iter().map(|x| x.num_rows()).sum::<usize>());
 
         Ok(())
@@ -1463,12 +1535,12 @@ mod tests {
         let ctx = ExecutionContext::new();
         let optimized_plan = ctx.optimize(&plan)?;
         match &optimized_plan {
-            LogicalPlan::Projection { input, .. } => match &**input {
-                LogicalPlan::TableScan {
+            LogicalPlan::Projection(Projection { input, .. }) => match &**input {
+                LogicalPlan::TableScan(TableScan {
                     source,
                     projected_schema,
                     ..
-                } => {
+                }) => {
                     assert_eq!(source.schema().fields().len(), 3);
                     assert_eq!(projected_schema.fields().len(), 1);
                 }
@@ -1489,7 +1561,8 @@ mod tests {
         assert_eq!(1, physical_plan.schema().fields().len());
         assert_eq!("b", physical_plan.schema().field(0).name().as_str());
 
-        let batches = collect(physical_plan).await?;
+        let runtime = ctx.state.lock().unwrap().runtime_env.clone();
+        let batches = collect(physical_plan, runtime).await?;
         assert_eq!(1, batches.len());
         assert_eq!(1, batches[0].num_columns());
         assert_eq!(4, batches[0].num_rows());
@@ -1817,6 +1890,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aggregate_decimal_min() -> Result<()> {
+        let mut ctx = ExecutionContext::new();
+        // the data type of c1 is decimal(10,3)
+        ctx.register_table("d_table", test::table_with_decimal())
+            .unwrap();
+        let result = plan_and_collect(&mut ctx, "select min(c1) from d_table")
+            .await
+            .unwrap();
+        let expected = vec![
+            "+-----------------+",
+            "| MIN(d_table.c1) |",
+            "+-----------------+",
+            "| -100.009        |",
+            "+-----------------+",
+        ];
+        assert_eq!(
+            &DataType::Decimal(10, 3),
+            result[0].schema().field(0).data_type()
+        );
+        assert_batches_sorted_eq!(expected, &result);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aggregate_decimal_max() -> Result<()> {
+        let mut ctx = ExecutionContext::new();
+        // the data type of c1 is decimal(10,3)
+        ctx.register_table("d_table", test::table_with_decimal())
+            .unwrap();
+
+        let result = plan_and_collect(&mut ctx, "select max(c1) from d_table")
+            .await
+            .unwrap();
+        let expected = vec![
+            "+-----------------+",
+            "| MAX(d_table.c1) |",
+            "+-----------------+",
+            "| 110.009         |",
+            "+-----------------+",
+        ];
+        assert_eq!(
+            &DataType::Decimal(10, 3),
+            result[0].schema().field(0).data_type()
+        );
+        assert_batches_sorted_eq!(expected, &result);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aggregate_decimal_sum() -> Result<()> {
+        let mut ctx = ExecutionContext::new();
+        // the data type of c1 is decimal(10,3)
+        ctx.register_table("d_table", test::table_with_decimal())
+            .unwrap();
+        let result = plan_and_collect(&mut ctx, "select sum(c1) from d_table")
+            .await
+            .unwrap();
+        let expected = vec![
+            "+-----------------+",
+            "| SUM(d_table.c1) |",
+            "+-----------------+",
+            "| 100.000         |",
+            "+-----------------+",
+        ];
+        assert_eq!(
+            &DataType::Decimal(20, 3),
+            result[0].schema().field(0).data_type()
+        );
+        assert_batches_sorted_eq!(expected, &result);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aggregate_decimal_avg() -> Result<()> {
+        let mut ctx = ExecutionContext::new();
+        // the data type of c1 is decimal(10,3)
+        ctx.register_table("d_table", test::table_with_decimal())
+            .unwrap();
+        let result = plan_and_collect(&mut ctx, "select avg(c1) from d_table")
+            .await
+            .unwrap();
+        let expected = vec![
+            "+-----------------+",
+            "| AVG(d_table.c1) |",
+            "+-----------------+",
+            "| 5.0000000       |",
+            "+-----------------+",
+        ];
+        assert_eq!(
+            &DataType::Decimal(14, 7),
+            result[0].schema().field(0).data_type()
+        );
+        assert_batches_sorted_eq!(expected, &result);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn aggregate() -> Result<()> {
         let results = execute("SELECT SUM(c1), SUM(c2) FROM test", 4).await?;
         assert_eq!(results.len(), 1);
@@ -2032,7 +2202,7 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert_eq!(results.to_string(), "Error during planning: Coercion from [Timestamp(Nanosecond, None)] to the signature Uniform(1, [Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64, Float32, Float64]) failed.");
+        assert_eq!(results.to_string(), "Error during planning: The function Sum does not support inputs of type Timestamp(Nanosecond, None).");
 
         Ok(())
     }
@@ -2129,7 +2299,7 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert_eq!(results.to_string(), "Error during planning: Coercion from [Timestamp(Nanosecond, None)] to the signature Uniform(1, [Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64, Float32, Float64]) failed.");
+        assert_eq!(results.to_string(), "Error during planning: The function Avg does not support inputs of type Timestamp(Nanosecond, None).");
         Ok(())
     }
 
@@ -2292,7 +2462,7 @@ mod tests {
 
             // generate some data
             for i in 0..10 {
-                let data = format!("{},2020-12-{}T00:00:00.000\n", i, i + 10);
+                let data = format!("{},2020-12-{}T00:00:00.000Z\n", i, i + 10);
                 file.write_all(data.as_bytes())?;
             }
         }
@@ -2811,6 +2981,7 @@ mod tests {
             let batch =
                 RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
             let provider = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+            ctx.deregister_table("t").unwrap();
             ctx.register_table("t", Arc::new(provider)).unwrap();
             let expected = vec![
                 "+-----------+",
@@ -3165,7 +3336,8 @@ mod tests {
 
         let plan = ctx.optimize(&plan)?;
         let plan = ctx.create_physical_plan(&plan).await?;
-        let result = collect(plan).await?;
+        let runtime = ctx.state.lock().unwrap().runtime_env.clone();
+        let result = collect(plan, runtime).await?;
 
         let expected = vec![
             "+-----+-----+-----------------+",
@@ -3873,8 +4045,8 @@ mod tests {
     async fn create_external_table_with_timestamps() {
         let mut ctx = ExecutionContext::new();
 
-        let data = "Jorge,2018-12-13T12:12:10.011\n\
-                    Andrew,2018-11-13T17:11:10.011";
+        let data = "Jorge,2018-12-13T12:12:10.011Z\n\
+                    Andrew,2018-11-13T17:11:10.011Z";
 
         let tmp_dir = TempDir::new().unwrap();
         let file_path = tmp_dir.path().join("timestamps.csv");

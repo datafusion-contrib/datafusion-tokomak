@@ -46,6 +46,12 @@ pub struct CsvReadOptions<'a> {
     pub file_extension: &'a str,
 }
 
+impl<'a> Default for CsvReadOptions<'a> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<'a> CsvReadOptions<'a> {
     /// Create a CSV read option with default presets
     pub fn new() -> Self {
@@ -108,7 +114,7 @@ impl<'a> CsvReadOptions<'a> {
             collect_stat: false,
             file_extension: self.file_extension.to_owned(),
             target_partitions,
-            partitions: vec![],
+            table_partition_cols: vec![],
         }
     }
 }
@@ -143,7 +149,7 @@ impl<'a> AvroReadOptions<'a> {
             collect_stat: false,
             file_extension: self.file_extension.to_owned(),
             target_partitions,
-            partitions: vec![],
+            table_partition_cols: vec![],
         }
     }
 }

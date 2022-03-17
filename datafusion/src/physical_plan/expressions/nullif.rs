@@ -19,11 +19,14 @@ use std::sync::Arc;
 
 use super::ColumnarValue;
 use crate::error::{DataFusionError, Result};
+use crate::physical_plan::expressions::binary::{eq_decimal, eq_decimal_scalar};
 use crate::scalar::ScalarValue;
 use arrow::array::Array;
 use arrow::array::*;
 use arrow::compute::kernels::boolean::nullif;
-use arrow::compute::kernels::comparison::{eq, eq_scalar, eq_utf8, eq_utf8_scalar};
+use arrow::compute::kernels::comparison::{
+    eq, eq_bool, eq_bool_scalar, eq_scalar, eq_utf8, eq_utf8_scalar,
+};
 use arrow::datatypes::{DataType, TimeUnit};
 
 /// Invoke a compute kernel on a primitive array and a Boolean Array

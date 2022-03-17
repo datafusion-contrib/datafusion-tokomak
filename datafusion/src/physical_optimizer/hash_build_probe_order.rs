@@ -38,6 +38,7 @@ use crate::error::Result;
 /// is the smallest.
 /// If the information is not available, the order stays the same,
 /// so that it could be optimized manually in a query.
+#[derive(Default)]
 pub struct HashBuildProbeOrder {}
 
 impl HashBuildProbeOrder {
@@ -123,6 +124,7 @@ impl PhysicalOptimizerRule for HashBuildProbeOrder {
                         .collect(),
                     &swap_join_type(*hash_join.join_type()),
                     *hash_join.partition_mode(),
+                    hash_join.null_equals_null(),
                 )?;
                 let proj = ProjectionExec::try_new(
                     swap_reverting_projection(&*left.schema(), &*right.schema()),
@@ -195,6 +197,7 @@ mod tests {
             )],
             &JoinType::Left,
             PartitionMode::CollectLeft,
+            &false,
         )
         .unwrap();
 
@@ -238,6 +241,7 @@ mod tests {
             )],
             &JoinType::Left,
             PartitionMode::CollectLeft,
+            &false,
         )
         .unwrap();
 

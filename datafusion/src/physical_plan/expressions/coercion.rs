@@ -30,6 +30,7 @@ pub fn is_signed_numeric(dt: &DataType) -> bool {
             | DataType::Float16
             | DataType::Float32
             | DataType::Float64
+            | DataType::Decimal(_, _)
     )
 }
 
@@ -100,11 +101,48 @@ pub fn like_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataTyp
 /// casted to for the purpose of a date computation
 pub fn temporal_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
     use arrow::datatypes::DataType::*;
+    use arrow::datatypes::TimeUnit;
     match (lhs_type, rhs_type) {
         (Utf8, Date32) => Some(Date32),
         (Date32, Utf8) => Some(Date32),
         (Utf8, Date64) => Some(Date64),
         (Date64, Utf8) => Some(Date64),
+        (Timestamp(lhs_unit, lhs_tz), Timestamp(rhs_unit, rhs_tz)) => {
+            let tz = match (lhs_tz, rhs_tz) {
+                // can't cast across timezones
+                (Some(lhs_tz), Some(rhs_tz)) => {
+                    if lhs_tz != rhs_tz {
+                        return None;
+                    } else {
+                        Some(lhs_tz.clone())
+                    }
+                }
+                (Some(lhs_tz), None) => Some(lhs_tz.clone()),
+                (None, Some(rhs_tz)) => Some(rhs_tz.clone()),
+                (None, None) => None,
+            };
+
+            let unit = match (lhs_unit, rhs_unit) {
+                (TimeUnit::Second, TimeUnit::Millisecond) => TimeUnit::Second,
+                (TimeUnit::Second, TimeUnit::Microsecond) => TimeUnit::Second,
+                (TimeUnit::Second, TimeUnit::Nanosecond) => TimeUnit::Second,
+                (TimeUnit::Millisecond, TimeUnit::Second) => TimeUnit::Second,
+                (TimeUnit::Millisecond, TimeUnit::Microsecond) => TimeUnit::Millisecond,
+                (TimeUnit::Millisecond, TimeUnit::Nanosecond) => TimeUnit::Millisecond,
+                (TimeUnit::Microsecond, TimeUnit::Second) => TimeUnit::Second,
+                (TimeUnit::Microsecond, TimeUnit::Millisecond) => TimeUnit::Millisecond,
+                (TimeUnit::Microsecond, TimeUnit::Nanosecond) => TimeUnit::Microsecond,
+                (TimeUnit::Nanosecond, TimeUnit::Second) => TimeUnit::Second,
+                (TimeUnit::Nanosecond, TimeUnit::Millisecond) => TimeUnit::Millisecond,
+                (TimeUnit::Nanosecond, TimeUnit::Microsecond) => TimeUnit::Microsecond,
+                (l, r) => {
+                    assert_eq!(l, r);
+                    l.clone()
+                }
+            };
+
+            Some(Timestamp(unit, tz))
+        }
         _ => None,
     }
 }
@@ -128,36 +166,16 @@ pub fn numerical_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<Da
     // these are ordered from most informative to least informative so
     // that the coercion removes the least amount of information
     match (lhs_type, rhs_type) {
-        (Float64, _) => Some(Float64),
-        (_, Float64) => Some(Float64),
-
-        (_, Float32) => Some(Float32),
-        (Float32, _) => Some(Float32),
-
-        (Int64, _) => Some(Int64),
-        (_, Int64) => Some(Int64),
-
-        (Int32, _) => Some(Int32),
-        (_, Int32) => Some(Int32),
-
-        (Int16, _) => Some(Int16),
-        (_, Int16) => Some(Int16),
-
-        (Int8, _) => Some(Int8),
-        (_, Int8) => Some(Int8),
-
-        (UInt64, _) => Some(UInt64),
-        (_, UInt64) => Some(UInt64),
-
-        (UInt32, _) => Some(UInt32),
-        (_, UInt32) => Some(UInt32),
-
-        (UInt16, _) => Some(UInt16),
-        (_, UInt16) => Some(UInt16),
-
-        (UInt8, _) => Some(UInt8),
-        (_, UInt8) => Some(UInt8),
-
+        (Float64, _) | (_, Float64) => Some(Float64),
+        (_, Float32) | (Float32, _) => Some(Float32),
+        (Int64, _) | (_, Int64) => Some(Int64),
+        (Int32, _) | (_, Int32) => Some(Int32),
+        (Int16, _) | (_, Int16) => Some(Int16),
+        (Int8, _) | (_, Int8) => Some(Int8),
+        (UInt64, _) | (_, UInt64) => Some(UInt64),
+        (UInt32, _) | (_, UInt32) => Some(UInt32),
+        (UInt16, _) | (_, UInt16) => Some(UInt16),
+        (UInt8, _) | (_, UInt8) => Some(UInt8),
         _ => None,
     }
 }
@@ -169,20 +187,6 @@ pub fn eq_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType>
         return Some(lhs_type.clone());
     }
     numerical_coercion(lhs_type, rhs_type)
-        .or_else(|| dictionary_coercion(lhs_type, rhs_type))
-        .or_else(|| temporal_coercion(lhs_type, rhs_type))
-}
-
-// coercion rules that assume an ordered set, such as "less than".
-// These are the union of all numerical coercion rules and all string coercion rules
-pub fn order_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
-    if lhs_type == rhs_type {
-        // same type => all good
-        return Some(lhs_type.clone());
-    }
-
-    numerical_coercion(lhs_type, rhs_type)
-        .or_else(|| string_coercion(lhs_type, rhs_type))
         .or_else(|| dictionary_coercion(lhs_type, rhs_type))
         .or_else(|| temporal_coercion(lhs_type, rhs_type))
 }

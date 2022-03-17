@@ -15,37 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![allow(bare_trait_objects)]
-
+use clap::{crate_version, App, Arg};
+use datafusion::error::Result;
+use datafusion::execution::context::ExecutionConfig;
+use datafusion_cli::{
+    context::Context,
+    exec,
+    print_format::{all_print_formats, PrintFormat},
+    print_options::PrintOptions,
+    DATAFUSION_CLI_VERSION,
+};
 use std::env;
 use std::fs::File;
-use std::io::prelude::*;
 use std::io::BufReader;
 use std::path::Path;
-use std::time::Instant;
-
-use ballista::context::BallistaContext;
-use ballista::prelude::BallistaConfig;
-use clap::{crate_version, App, Arg};
-use datafusion::error::{DataFusionError, Result};
-use datafusion::execution::context::{ExecutionConfig, ExecutionContext};
-use datafusion_cli::{
-    print_format::{all_print_formats, PrintFormat},
-    PrintOptions, DATAFUSION_CLI_VERSION,
-};
-use rustyline::Editor;
-
-/// The CLI supports using a local DataFusion context or a distributed BallistaContext
-enum Context {
-    /// In-process execution with DataFusion
-    Local(ExecutionContext),
-    /// Distributed execution with Ballista
-    Remote(BallistaContext),
-}
 
 #[tokio::main]
 pub async fn main() -> Result<()> {
-    let matches = App::new("DataFusion")
+    let owned_print_formats = all_print_formats()
+        .iter()
+        .map(|format| format.to_string())
+        .collect::<Vec<_>>();
+    let all_print_formats = owned_print_formats
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>();
+    let mut app = App::new("DataFusion")
         .version(crate_version!())
         .about(
             "DataFusion is an in-memory query engine that uses Apache Arrow \
@@ -82,15 +77,7 @@ pub async fn main() -> Result<()> {
                 .help("Output format")
                 .long("format")
                 .default_value("table")
-                .possible_values(
-                    &all_print_formats()
-                        .iter()
-                        .map(|format| format.to_string())
-                        .collect::<Vec<_>>()
-                        .iter()
-                        .map(|i| i.as_str())
-                        .collect::<Vec<_>>(),
-                )
+                .possible_values(&all_print_formats)
                 .takes_value(true),
         )
         .arg(
@@ -111,10 +98,20 @@ pub async fn main() -> Result<()> {
                 .short("q")
                 .long("quiet")
                 .takes_value(false),
-        )
-        .get_matches();
+        );
+    if cfg!(feature = "experimental-tokomak") {
+        app = app.arg(
+            Arg::with_name("tokomak")
+                .help("Enables the experimental tokomak optimizer")
+                .short("t")
+                .long("tokomak")
+                .takes_value(false),
+        );
+    }
+    let matches = app.get_matches();
 
     let quiet = matches.is_present("quiet");
+    let tokomak = matches.is_present("tokomak");
 
     if !quiet {
         println!("DataFusion CLI v{}\n", DATAFUSION_CLI_VERSION);
@@ -130,7 +127,7 @@ pub async fn main() -> Result<()> {
         env::set_current_dir(&p).unwrap();
     };
 
-    let mut execution_config = ExecutionConfig::new().with_information_schema(true);
+    let mut execution_config = exec_context(tokomak);
 
     if let Some(batch_size) = matches
         .value_of("batch-size")
@@ -139,17 +136,10 @@ pub async fn main() -> Result<()> {
         execution_config = execution_config.with_batch_size(batch_size);
     };
 
-    let ctx: Result<Context> = match (host, port) {
-        (Some(h), Some(p)) => {
-            let config: BallistaConfig = BallistaConfig::new()
-                .map_err(|e| DataFusionError::Execution(format!("{:?}", e)))?;
-            Ok(Context::Remote(BallistaContext::remote(h, p, &config)))
-        }
-        _ => Ok(Context::Local(ExecutionContext::with_config(
-            execution_config.clone(),
-        ))),
+    let mut ctx: Context = match (host, port) {
+        (Some(h), Some(p)) => Context::new_remote(h, p)?,
+        _ => Context::new_local(&execution_config),
     };
-    let mut ctx = ctx?;
 
     let format = matches
         .value_of("format")
@@ -157,7 +147,7 @@ pub async fn main() -> Result<()> {
         .parse::<PrintFormat>()
         .expect("Invalid format");
 
-    let print_options = PrintOptions { format, quiet };
+    let mut print_options = PrintOptions { format, quiet };
 
     if let Some(file_paths) = matches.values_of("file") {
         let files = file_paths
@@ -165,88 +155,88 @@ pub async fn main() -> Result<()> {
             .collect::<Vec<_>>();
         for file in files {
             let mut reader = BufReader::new(file);
-            exec_from_lines(&mut ctx, &mut reader, print_options.clone()).await;
+            exec::exec_from_lines(&mut ctx, &mut reader, &print_options).await;
         }
     } else {
-        exec_from_repl(&mut ctx, print_options).await;
+        exec::exec_from_repl(&mut ctx, &mut print_options).await;
     }
 
     Ok(())
 }
 
-async fn exec_from_lines(
-    ctx: &mut Context,
-    reader: &mut BufReader<File>,
-    print_options: PrintOptions,
-) {
-    let mut query = "".to_owned();
+#[cfg(feature = "experimental-tokomak")]
+fn get_tokomak_optimizers() -> Vec<
+    std::sync::Arc<
+        dyn datafusion::optimizer::optimizer::OptimizerRule + Send + Sync + 'static,
+    >,
+> {
+    use datafusion::optimizer::{
+        common_subexpr_eliminate::CommonSubexprEliminate,
+        eliminate_limit::EliminateLimit, filter_push_down::FilterPushDown,
+        limit_push_down::LimitPushDown, projection_push_down::ProjectionPushDown,
+        simplify_expressions::SimplifyExpressions,
+        single_distinct_to_groupby::SingleDistinctToGroupBy,
+    };
+    use std::sync::Arc;
+    let mut settings = tokomak::RunnerSettings::new();
+    settings
+        .with_iter_limit(get_tokomak_iter_limit())
+        .with_node_limit(get_tokomak_node_limit())
+        .with_time_limit(std::time::Duration::from_secs_f64(get_tokomak_opt_seconds()));
 
-    for line in reader.lines() {
-        match line {
-            Ok(line) if line.starts_with("--") => {
-                continue;
-            }
-            Ok(line) => {
-                let line = line.trim_end();
-                query.push_str(line);
-                if line.ends_with(';') {
-                    match exec_and_print(ctx, print_options.clone(), query).await {
-                        Ok(_) => {}
-                        Err(err) => println!("{:?}", err),
-                    }
-                    query = "".to_owned();
-                } else {
-                    query.push('\n');
-                }
-            }
-            _ => {
-                break;
-            }
-        }
-    }
-
-    // run the left over query if the last statement doesn't contain ‘;’
-    if !query.is_empty() {
-        match exec_and_print(ctx, print_options, query).await {
-            Ok(_) => {}
-            Err(err) => println!("{:?}", err),
-        }
-    }
+    let tokomak_optimizer =
+        tokomak::Tokomak::with_builtin_rules(settings, tokomak::ALL_RULES);
+    vec![
+        Arc::new(SimplifyExpressions::new()),
+        Arc::new(tokomak_optimizer),
+        Arc::new(SimplifyExpressions::new()),
+        Arc::new(CommonSubexprEliminate::new()),
+        Arc::new(EliminateLimit::new()),
+        Arc::new(ProjectionPushDown::new()),
+        Arc::new(FilterPushDown::new()),
+        Arc::new(LimitPushDown::new()),
+        Arc::new(SingleDistinctToGroupBy::new()),
+    ]
 }
 
-async fn exec_from_repl(ctx: &mut Context, print_options: PrintOptions) {
-    let mut rl = Editor::<()>::new();
-    rl.load_history(".history").ok();
+#[cfg(feature = "experimental-tokomak")]
+fn get_tokomak_opt_seconds() -> f64 {
+    const DEFAULT_TIME: f64 = 0.5;
+    let str_time =
+        std::env::var("TOKOMAK_OPT_TIME").unwrap_or_else(|_| format!("{}", DEFAULT_TIME));
+    let opt_seconds: f64 = str_time.parse().unwrap_or(DEFAULT_TIME);
+    opt_seconds
+}
+#[cfg(feature = "experimental-tokomak")]
+fn get_tokomak_node_limit() -> usize {
+    const DEFAULT_NODE_LIMIT: usize = 1_000_000;
+    let str_lim = std::env::var("TOKOMAK_NODE_LIMIT")
+        .unwrap_or_else(|_| format!("{}", DEFAULT_NODE_LIMIT));
+    let lim: usize = str_lim.parse().unwrap_or(DEFAULT_NODE_LIMIT);
+    lim
+}
+#[cfg(feature = "experimental-tokomak")]
+fn get_tokomak_iter_limit() -> usize {
+    const DEFAULT_ITER_LIMIT: usize = 1000;
+    let str_lim = std::env::var("TOKOMAK_ITER_LIMIT")
+        .unwrap_or_else(|_| format!("{}", DEFAULT_ITER_LIMIT));
+    let lim: usize = str_lim.parse().unwrap_or(DEFAULT_ITER_LIMIT);
+    lim
+}
 
-    let mut query = "".to_owned();
-    loop {
-        match rl.readline("> ") {
-            Ok(ref line) if is_exit_command(line) && query.is_empty() => {
-                break;
-            }
-            Ok(ref line) if line.starts_with("--") => {
-                continue;
-            }
-            Ok(ref line) if line.trim_end().ends_with(';') => {
-                query.push_str(line.trim_end());
-                rl.add_history_entry(query.clone());
-                match exec_and_print(ctx, print_options.clone(), query).await {
-                    Ok(_) => {}
-                    Err(err) => println!("{:?}", err),
-                }
-                query = "".to_owned();
-            }
-            Ok(ref line) => {
-                query.push_str(line);
-                query.push('\n');
-            }
-            Err(_) => {
-                break;
-            }
-        }
+#[cfg(feature = "experimental-tokomak")]
+fn exec_context(tokomak: bool) -> ExecutionConfig {
+    let mut execution_config = ExecutionConfig::new().with_information_schema(true);
+    if tokomak {
+        execution_config =
+            execution_config.with_optimizer_rules(get_tokomak_optimizers());
     }
+    execution_config
+}
 
-    rl.save_history(".history").ok();
+#[cfg(not(feature = "experimental-tokomak"))]
+fn exec_context(_tokomak: bool) -> ExecutionConfig {
+    ExecutionConfig::new().with_information_schema(true)
 }
 
 fn is_valid_file(dir: String) -> std::result::Result<(), String> {
@@ -270,27 +260,4 @@ fn is_valid_batch_size(size: String) -> std::result::Result<(), String> {
         Ok(size) if size > 0 => Ok(()),
         _ => Err(format!("Invalid batch size '{}'", size)),
     }
-}
-
-fn is_exit_command(line: &str) -> bool {
-    let line = line.trim_end().to_lowercase();
-    line == "quit" || line == "exit"
-}
-
-async fn exec_and_print(
-    ctx: &mut Context,
-    print_options: PrintOptions,
-    sql: String,
-) -> Result<()> {
-    let now = Instant::now();
-
-    let df = match ctx {
-        Context::Local(datafusion) => datafusion.sql(&sql).await?,
-        Context::Remote(ballista) => ballista.sql(&sql).await?,
-    };
-
-    let results = df.collect().await?;
-    print_options.print_batches(&results, now)?;
-
-    Ok(())
 }

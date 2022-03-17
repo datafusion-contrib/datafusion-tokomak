@@ -25,10 +25,11 @@ use arrow::{self, datatypes::SchemaRef};
 use async_trait::async_trait;
 use futures::StreamExt;
 
-use super::{FileFormat, PhysicalPlanConfig};
+use super::FileFormat;
 use crate::datasource::object_store::{ObjectReader, ObjectReaderStream};
 use crate::error::Result;
-use crate::physical_plan::file_format::CsvExec;
+use crate::logical_plan::Expr;
+use crate::physical_plan::file_format::{CsvExec, PhysicalPlanConfig};
 use crate::physical_plan::ExecutionPlan;
 use crate::physical_plan::Statistics;
 
@@ -123,18 +124,9 @@ impl FileFormat for CsvFormat {
     async fn create_physical_plan(
         &self,
         conf: PhysicalPlanConfig,
+        _filters: &[Expr],
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let exec = CsvExec::new(
-            conf.object_store,
-            conf.files,
-            conf.statistics,
-            conf.schema,
-            self.has_header,
-            self.delimiter,
-            conf.projection,
-            conf.batch_size,
-            conf.limit,
-        );
+        let exec = CsvExec::new(conf, self.has_header, self.delimiter);
         Ok(Arc::new(exec))
     }
 }
@@ -144,24 +136,25 @@ mod tests {
     use arrow::array::StringArray;
 
     use super::*;
+    use crate::execution::runtime_env::RuntimeEnv;
     use crate::{
         datasource::{
             file_format::PhysicalPlanConfig,
             object_store::local::{
-                local_file_meta, local_object_reader, local_object_reader_stream,
-                LocalFileSystem,
+                local_object_reader, local_object_reader_stream,
+                local_unpartitioned_file, LocalFileSystem,
             },
-            PartitionedFile,
         },
         physical_plan::collect,
     };
 
     #[tokio::test]
     async fn read_small_batches() -> Result<()> {
+        let runtime = Arc::new(RuntimeEnv::default());
         // skip column 9 that overflows the automaticly discovered column type of i64 (u64 would work)
         let projection = Some(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12]);
         let exec = get_exec("aggregate_test_100.csv", &projection, 2, None).await?;
-        let stream = exec.execute(0).await?;
+        let stream = exec.execute(0, runtime).await?;
 
         let tt_batches: i32 = stream
             .map(|batch| {
@@ -183,9 +176,10 @@ mod tests {
 
     #[tokio::test]
     async fn read_limit() -> Result<()> {
+        let runtime = Arc::new(RuntimeEnv::default());
         let projection = Some(vec![0, 1, 2, 3]);
         let exec = get_exec("aggregate_test_100.csv", &projection, 1024, Some(1)).await?;
-        let batches = collect(exec).await?;
+        let batches = collect(exec, runtime).await?;
         assert_eq!(1, batches.len());
         assert_eq!(4, batches[0].num_columns());
         assert_eq!(1, batches[0].num_rows());
@@ -228,10 +222,11 @@ mod tests {
 
     #[tokio::test]
     async fn read_char_column() -> Result<()> {
+        let runtime = Arc::new(RuntimeEnv::default());
         let projection = Some(vec![0]);
         let exec = get_exec("aggregate_test_100.csv", &projection, 1024, None).await?;
 
-        let batches = collect(exec).await.expect("Collect batches");
+        let batches = collect(exec, runtime).await.expect("Collect batches");
 
         assert_eq!(1, batches.len());
         assert_eq!(1, batches[0].num_columns());
@@ -261,7 +256,7 @@ mod tests {
         let testdata = crate::test_util::arrow_test_data();
         let filename = format!("{}/csv/{}", testdata, file_name);
         let format = CsvFormat::default();
-        let schema = format
+        let file_schema = format
             .infer_schema(local_object_reader_stream(vec![filename.clone()]))
             .await
             .expect("Schema inference");
@@ -269,20 +264,21 @@ mod tests {
             .infer_stats(local_object_reader(filename.clone()))
             .await
             .expect("Stats inference");
-        let files = vec![vec![PartitionedFile {
-            file_meta: local_file_meta(filename.to_owned()),
-        }]];
+        let file_groups = vec![vec![local_unpartitioned_file(filename.to_owned())]];
         let exec = format
-            .create_physical_plan(PhysicalPlanConfig {
-                object_store: Arc::new(LocalFileSystem {}),
-                schema,
-                files,
-                statistics,
-                projection: projection.clone(),
-                batch_size,
-                filters: vec![],
-                limit,
-            })
+            .create_physical_plan(
+                PhysicalPlanConfig {
+                    object_store: Arc::new(LocalFileSystem {}),
+                    file_schema,
+                    file_groups,
+                    statistics,
+                    projection: projection.clone(),
+                    batch_size,
+                    limit,
+                    table_partition_cols: vec![],
+                },
+                &[],
+            )
             .await?;
         Ok(exec)
     }

@@ -18,13 +18,14 @@
 //! Optimizer rule to replace `LIMIT 0` on a plan with an empty relation.
 //! This saves time in planning and executing the query.
 use crate::error::Result;
-use crate::logical_plan::LogicalPlan;
+use crate::logical_plan::{EmptyRelation, Limit, LogicalPlan};
 use crate::optimizer::optimizer::OptimizerRule;
 
 use super::utils;
 use crate::execution::context::ExecutionProps;
 
 /// Optimization rule that replaces LIMIT 0 with an [LogicalPlan::EmptyRelation]
+#[derive(Default)]
 pub struct EliminateLimit;
 
 impl EliminateLimit {
@@ -41,11 +42,11 @@ impl OptimizerRule for EliminateLimit {
         execution_props: &ExecutionProps,
     ) -> Result<LogicalPlan> {
         match plan {
-            LogicalPlan::Limit { n, input } if *n == 0 => {
-                Ok(LogicalPlan::EmptyRelation {
+            LogicalPlan::Limit(Limit { n, input }) if *n == 0 => {
+                Ok(LogicalPlan::EmptyRelation(EmptyRelation {
                     produce_one_row: false,
                     schema: input.schema().clone(),
-                })
+                }))
             }
             // Rest: recurse and find possible LIMIT 0 nodes
             _ => {

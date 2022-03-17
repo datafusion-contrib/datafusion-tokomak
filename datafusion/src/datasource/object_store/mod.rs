@@ -70,7 +70,7 @@ pub enum ListEntry {
 }
 
 /// The path and size of the file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SizedFile {
     /// Path of the file. It is relative to the current object
     /// store (it does not specify the `xx://` scheme).
@@ -82,7 +82,7 @@ pub struct SizedFile {
 /// Description of a file as returned by the listing command of a
 /// given object store. The resulting path is relative to the
 /// object store that generated it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FileMeta {
     /// The path and size of the file.
     pub sized_file: SizedFile,
@@ -171,7 +171,7 @@ pub struct ObjectStoreRegistry {
 }
 
 impl fmt::Debug for ObjectStoreRegistry {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("ObjectStoreRegistry")
             .field(
                 "schemes",
@@ -183,6 +183,12 @@ impl fmt::Debug for ObjectStoreRegistry {
                     .collect::<Vec<_>>(),
             )
             .finish()
+    }
+}
+
+impl Default for ObjectStoreRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

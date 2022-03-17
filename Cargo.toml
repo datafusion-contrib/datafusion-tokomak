@@ -26,9 +26,8 @@ members = [
     "ballista/rust/executor",
     "ballista/rust/scheduler",
     "ballista-examples",
+    "tokomak"
 ]
-
-exclude = ["python"]
 
 [profile.release]
 lto = true

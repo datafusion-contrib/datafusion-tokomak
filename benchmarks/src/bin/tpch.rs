@@ -17,6 +17,9 @@
 
 //! Benchmark derived from TPC-H. This is not an official TPC-H benchmark.
 
+use futures::future::join_all;
+use rand::prelude::*;
+use std::ops::Div;
 use std::{
     fs,
     iter::Iterator,
@@ -75,10 +78,9 @@ struct BallistaBenchmarkOpt {
     #[structopt(short = "i", long = "iterations", default_value = "3")]
     iterations: usize,
 
-    /// Batch size when reading CSV or Parquet files
-    #[structopt(short = "s", long = "batch-size", default_value = "8192")]
-    batch_size: usize,
-
+    // /// Batch size when reading CSV or Parquet files
+    // #[structopt(short = "s", long = "batch-size", default_value = "8192")]
+    // batch_size: usize,
     /// Path to data files
     #[structopt(parse(from_os_str), required = true, short = "p", long = "path")]
     path: PathBuf,
@@ -87,12 +89,11 @@ struct BallistaBenchmarkOpt {
     #[structopt(short = "f", long = "format", default_value = "csv")]
     file_format: String,
 
-    /// Load the data into a MemTable before executing the query
-    #[structopt(short = "m", long = "mem-table")]
-    mem_table: bool,
-
+    // /// Load the data into a MemTable before executing the query
+    // #[structopt(short = "m", long = "mem-table")]
+    // mem_table: bool,
     /// Number of partitions to process in parallel
-    #[structopt(short = "p", long = "partitions", default_value = "2")]
+    #[structopt(short = "n", long = "partitions", default_value = "2")]
     partitions: usize,
 
     /// Ballista executor host
@@ -119,7 +120,7 @@ struct DataFusionBenchmarkOpt {
     iterations: usize,
 
     /// Number of partitions to process in parallel
-    #[structopt(short = "p", long = "partitions", default_value = "2")]
+    #[structopt(short = "n", long = "partitions", default_value = "2")]
     partitions: usize,
 
     /// Batch size when reading CSV or Parquet files
@@ -137,6 +138,52 @@ struct DataFusionBenchmarkOpt {
     /// Load the data into a MemTable before executing the query
     #[structopt(short = "m", long = "mem-table")]
     mem_table: bool,
+
+    ///Whether or not to enable to experimental tokomak optimizer
+    #[structopt(short = "t", long = "experimental-tokomak")]
+    tokomak: bool,
+}
+
+#[derive(Debug, StructOpt, Clone)]
+struct BallistaLoadtestOpt {
+    #[structopt(short = "q", long)]
+    query_list: String,
+
+    /// Activate debug mode to see query results
+    #[structopt(short, long)]
+    debug: bool,
+
+    /// Number of requests
+    #[structopt(short = "r", long = "requests", default_value = "100")]
+    requests: usize,
+
+    /// Number of connections
+    #[structopt(short = "c", long = "concurrency", default_value = "5")]
+    concurrency: usize,
+
+    /// Number of partitions to process in parallel
+    #[structopt(short = "n", long = "partitions", default_value = "2")]
+    partitions: usize,
+
+    /// Path to data files
+    #[structopt(parse(from_os_str), required = true, short = "p", long = "data-path")]
+    path: PathBuf,
+
+    /// Path to sql files
+    #[structopt(parse(from_os_str), required = true, long = "sql-path")]
+    sql_path: PathBuf,
+
+    /// File format: `csv` or `parquet`
+    #[structopt(short = "f", long = "format", default_value = "parquet")]
+    file_format: String,
+
+    /// Ballista executor host
+    #[structopt(long = "host")]
+    host: Option<String>,
+
+    /// Ballista executor port
+    #[structopt(long = "port")]
+    port: Option<u16>,
 }
 
 #[derive(Debug, StructOpt)]
@@ -158,7 +205,7 @@ struct ConvertOpt {
     compression: String,
 
     /// Number of partitions to produce
-    #[structopt(short = "p", long = "partitions", default_value = "1")]
+    #[structopt(short = "n", long = "partitions", default_value = "1")]
     partitions: usize,
 
     /// Batch size when reading CSV or Parquet files
@@ -176,10 +223,18 @@ enum BenchmarkSubCommandOpt {
 }
 
 #[derive(Debug, StructOpt)]
+#[structopt(about = "loadtest command")]
+enum LoadtestOpt {
+    #[structopt(name = "ballista-load")]
+    BallistaLoadtest(BallistaLoadtestOpt),
+}
+
+#[derive(Debug, StructOpt)]
 #[structopt(name = "TPC-H", about = "TPC-H Benchmarks.")]
 enum TpchOpt {
     Benchmark(BenchmarkSubCommandOpt),
     Convert(ConvertOpt),
+    Loadtest(LoadtestOpt),
 }
 
 const TABLES: &[&str] = &[
@@ -189,6 +244,7 @@ const TABLES: &[&str] = &[
 #[tokio::main]
 async fn main() -> Result<()> {
     use BenchmarkSubCommandOpt::*;
+    use LoadtestOpt::*;
 
     env_logger::init();
     match TpchOpt::from_args() {
@@ -199,15 +255,102 @@ async fn main() -> Result<()> {
             benchmark_datafusion(opt).await.map(|_| ())
         }
         TpchOpt::Convert(opt) => convert_tbl(opt).await,
+        TpchOpt::Loadtest(BallistaLoadtest(opt)) => {
+            loadtest_ballista(opt).await.map(|_| ())
+        }
     }
+}
+#[cfg(feature = "experimental-tokomak")]
+fn get_tokomak_opt_seconds() -> f64 {
+    const DEFAULT_TIME: f64 = 0.5;
+    let str_time =
+        std::env::var("TOKOMAK_OPT_TIME").unwrap_or_else(|_| format!("{}", DEFAULT_TIME));
+    let opt_seconds: f64 = str_time.parse().unwrap_or(DEFAULT_TIME);
+    println!("Tokomak will limit itself to {}s", opt_seconds);
+    opt_seconds
+}
+#[cfg(feature = "experimental-tokomak")]
+fn get_tokomak_node_limit() -> usize {
+    const DEFAULT_NODE_LIMIT: usize = 1_000_000;
+    let str_lim = std::env::var("TOKOMAK_NODE_LIMIT")
+        .unwrap_or_else(|_| format!("{}", DEFAULT_NODE_LIMIT));
+    let lim: usize = str_lim.parse().unwrap_or(DEFAULT_NODE_LIMIT);
+    println!("Tokomak optimizer will limit itself to {} nodes", lim);
+    lim
+}
+#[cfg(feature = "experimental-tokomak")]
+fn get_tokomak_iter_limit() -> usize {
+    const DEFAULT_ITER_LIMIT: usize = 1000;
+    let str_lim = std::env::var("TOKOMAK_ITER_LIMIT")
+        .unwrap_or_else(|_| format!("{}", DEFAULT_ITER_LIMIT));
+    let lim: usize = str_lim.parse().unwrap_or(DEFAULT_ITER_LIMIT);
+    println!("Tokomak optimizer wil limit itself to {} iterations", lim);
+    lim
+}
+
+#[cfg(feature = "experimental-tokomak")]
+fn get_tokomak_optimizers(
+) -> Vec<Arc<dyn datafusion::optimizer::optimizer::OptimizerRule + Send + Sync + 'static>>
+{
+    use datafusion::optimizer::{
+        common_subexpr_eliminate::CommonSubexprEliminate,
+        eliminate_limit::EliminateLimit, filter_push_down::FilterPushDown,
+        limit_push_down::LimitPushDown, projection_push_down::ProjectionPushDown,
+        simplify_expressions::SimplifyExpressions,
+        single_distinct_to_groupby::SingleDistinctToGroupBy,
+    };
+    let mut settings = tokomak::RunnerSettings::new();
+    settings
+        .with_iter_limit(get_tokomak_iter_limit())
+        .with_node_limit(get_tokomak_node_limit())
+        .with_time_limit(std::time::Duration::from_secs_f64(get_tokomak_opt_seconds()));
+
+    let tokomak_optimizer =
+        tokomak::Tokomak::with_builtin_rules(settings, tokomak::ALL_RULES);
+    vec![
+        Arc::new(SimplifyExpressions::new()),
+        Arc::new(tokomak_optimizer),
+        Arc::new(SimplifyExpressions::new()),
+        Arc::new(CommonSubexprEliminate::new()),
+        Arc::new(EliminateLimit::new()),
+        Arc::new(ProjectionPushDown::new()),
+        Arc::new(FilterPushDown::new()),
+        Arc::new(LimitPushDown::new()),
+        Arc::new(SingleDistinctToGroupBy::new()),
+    ]
+}
+
+#[cfg(not(feature = "experimental-tokomak"))]
+fn with_optimizers_datafusion(
+    config: ExecutionConfig,
+    opt: &DataFusionBenchmarkOpt,
+) -> ExecutionConfig {
+    if opt.tokomak {
+        panic!("To enable the tokomak optimizer tpch must be compiled with the 'experimental-tokomak' feature");
+    }
+    config
+}
+
+#[cfg(feature = "experimental-tokomak")]
+fn with_optimizers_datafusion(
+    mut config: ExecutionConfig,
+    opt: &DataFusionBenchmarkOpt,
+) -> ExecutionConfig {
+    if opt.tokomak {
+        config = config.with_optimizer_rules(get_tokomak_optimizers());
+    }
+    config
 }
 
 async fn benchmark_datafusion(opt: DataFusionBenchmarkOpt) -> Result<Vec<RecordBatch>> {
     println!("Running benchmarks with the following options: {:?}", opt);
-    let config = ExecutionConfig::new()
+
+    let mut config = ExecutionConfig::new()
         .with_target_partitions(opt.partitions)
         .with_batch_size(opt.batch_size);
+    config = with_optimizers_datafusion(config, &opt);
     let mut ctx = ExecutionContext::with_config(config);
+    let runtime = ctx.state.lock().unwrap().runtime_env.clone();
 
     // register tables
     for table in TABLES {
@@ -221,9 +364,13 @@ async fn benchmark_datafusion(opt: DataFusionBenchmarkOpt) -> Result<Vec<RecordB
             println!("Loading table '{}' into memory", table);
             let start = Instant::now();
 
-            let memtable =
-                MemTable::load(table_provider, opt.batch_size, Some(opt.partitions))
-                    .await?;
+            let memtable = MemTable::load(
+                table_provider,
+                opt.batch_size,
+                Some(opt.partitions),
+                runtime.clone(),
+            )
+            .await?;
             println!(
                 "Loaded table '{}' into memory in {} ms",
                 table,
@@ -238,6 +385,7 @@ async fn benchmark_datafusion(opt: DataFusionBenchmarkOpt) -> Result<Vec<RecordB
     let mut millis = vec![];
     // run benchmark
     let mut result: Vec<RecordBatch> = Vec::with_capacity(1);
+
     for i in 0..opt.iterations {
         let start = Instant::now();
         let plan = create_logical_plan(&mut ctx, opt.query)?;
@@ -270,6 +418,151 @@ async fn benchmark_ballista(opt: BallistaBenchmarkOpt) -> Result<()> {
     // register tables with Ballista context
     let path = opt.path.to_str().unwrap();
     let file_format = opt.file_format.as_str();
+
+    register_tables(path, file_format, &ctx).await;
+
+    let mut millis = vec![];
+
+    // run benchmark
+    let sql = get_query_sql(opt.query)?;
+    println!("Running benchmark with query {}:\n {}", opt.query, sql);
+    for i in 0..opt.iterations {
+        let start = Instant::now();
+        let df = ctx
+            .sql(&sql)
+            .await
+            .map_err(|e| DataFusionError::Plan(format!("{:?}", e)))
+            .unwrap();
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| DataFusionError::Plan(format!("{:?}", e)))
+            .unwrap();
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        millis.push(elapsed as f64);
+        println!("Query {} iteration {} took {:.1} ms", opt.query, i, elapsed);
+        if opt.debug {
+            pretty::print_batches(&batches)?;
+        }
+    }
+
+    let avg = millis.iter().sum::<f64>() / millis.len() as f64;
+    println!("Query {} avg time: {:.2} ms", opt.query, avg);
+
+    Ok(())
+}
+
+async fn loadtest_ballista(opt: BallistaLoadtestOpt) -> Result<()> {
+    println!(
+        "Running loadtest_ballista with the following options: {:?}",
+        opt
+    );
+
+    let config = BallistaConfig::builder()
+        .set(
+            BALLISTA_DEFAULT_SHUFFLE_PARTITIONS,
+            &format!("{}", opt.partitions),
+        )
+        .build()
+        .map_err(|e| DataFusionError::Execution(format!("{:?}", e)))?;
+
+    let concurrency = opt.concurrency;
+    let request_amount = opt.requests;
+    let mut clients = vec![];
+
+    for _num in 0..concurrency {
+        clients.push(BallistaContext::remote(
+            opt.host.clone().unwrap().as_str(),
+            opt.port.unwrap(),
+            &config,
+        ));
+    }
+
+    // register tables with Ballista context
+    let path = opt.path.to_str().unwrap();
+    let file_format = opt.file_format.as_str();
+    let sql_path = opt.sql_path.to_str().unwrap().to_string();
+
+    for ctx in &clients {
+        register_tables(path, file_format, ctx).await;
+    }
+
+    let request_per_thread = request_amount.div(concurrency);
+    // run benchmark
+    let query_list: Vec<usize> = opt
+        .query_list
+        .split(',')
+        .map(|s| s.parse().unwrap())
+        .collect();
+    println!("query list: {:?} ", &query_list);
+
+    let total = Instant::now();
+    let mut futures = vec![];
+
+    for (client_id, client) in clients.into_iter().enumerate() {
+        let query_list_clone = query_list.clone();
+        let sql_path_clone = sql_path.clone();
+        let handle = tokio::spawn(async move {
+            for i in 0..request_per_thread {
+                let query_id = query_list_clone
+                    .get(
+                        (0..query_list_clone.len())
+                            .choose(&mut rand::thread_rng())
+                            .unwrap(),
+                    )
+                    .unwrap();
+                let sql =
+                    get_query_sql_by_path(query_id.to_owned(), sql_path_clone.clone())
+                        .unwrap();
+                println!(
+                    "Client {} Round {} Query {} started",
+                    &client_id, &i, query_id
+                );
+                let start = Instant::now();
+                let df = client
+                    .sql(&sql)
+                    .await
+                    .map_err(|e| DataFusionError::Plan(format!("{:?}", e)))
+                    .unwrap();
+                let batches = df
+                    .collect()
+                    .await
+                    .map_err(|e| DataFusionError::Plan(format!("{:?}", e)))
+                    .unwrap();
+                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                println!(
+                    "Client {} Round {} Query {} took {:.1} ms ",
+                    &client_id, &i, query_id, elapsed
+                );
+                if opt.debug {
+                    pretty::print_batches(&batches).unwrap();
+                }
+            }
+        });
+        futures.push(handle);
+    }
+    join_all(futures).await;
+    let elapsed = total.elapsed().as_secs_f64() * 1000.0;
+    println!("###############################");
+    println!("load test  took {:.1} ms", elapsed);
+    Ok(())
+}
+
+fn get_query_sql_by_path(query: usize, mut sql_path: String) -> Result<String> {
+    if sql_path.ends_with('/') {
+        sql_path.pop();
+    }
+    if query > 0 && query < 23 {
+        let filename = format!("{}/q{}.sql", sql_path, query);
+        Ok(fs::read_to_string(&filename).expect("failed to read query"))
+    } else {
+        Err(DataFusionError::Plan(
+            "invalid query. Expected value between 1 and 22".to_owned(),
+        ))
+    }
+}
+
+async fn register_tables(path: &str, file_format: &str, ctx: &BallistaContext) {
     for table in TABLES {
         match file_format {
             // dbgen creates .tbl ('|' delimited) files without header
@@ -283,7 +576,8 @@ async fn benchmark_ballista(opt: BallistaBenchmarkOpt) -> Result<()> {
                     .file_extension(".tbl");
                 ctx.register_csv(table, &path, options)
                     .await
-                    .map_err(|e| DataFusionError::Plan(format!("{:?}", e)))?;
+                    .map_err(|e| DataFusionError::Plan(format!("{:?}", e)))
+                    .unwrap();
             }
             "csv" => {
                 let path = format!("{}/{}", path, table);
@@ -291,47 +585,21 @@ async fn benchmark_ballista(opt: BallistaBenchmarkOpt) -> Result<()> {
                 let options = CsvReadOptions::new().schema(&schema).has_header(true);
                 ctx.register_csv(table, &path, options)
                     .await
-                    .map_err(|e| DataFusionError::Plan(format!("{:?}", e)))?;
+                    .map_err(|e| DataFusionError::Plan(format!("{:?}", e)))
+                    .unwrap();
             }
             "parquet" => {
                 let path = format!("{}/{}", path, table);
                 ctx.register_parquet(table, &path)
                     .await
-                    .map_err(|e| DataFusionError::Plan(format!("{:?}", e)))?;
+                    .map_err(|e| DataFusionError::Plan(format!("{:?}", e)))
+                    .unwrap();
             }
             other => {
                 unimplemented!("Invalid file format '{}'", other);
             }
         }
     }
-
-    let mut millis = vec![];
-
-    // run benchmark
-    let sql = get_query_sql(opt.query)?;
-    println!("Running benchmark with query {}:\n {}", opt.query, sql);
-    for i in 0..opt.iterations {
-        let start = Instant::now();
-        let df = ctx
-            .sql(&sql)
-            .await
-            .map_err(|e| DataFusionError::Plan(format!("{:?}", e)))?;
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| DataFusionError::Plan(format!("{:?}", e)))?;
-        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-        millis.push(elapsed as f64);
-        println!("Query {} iteration {} took {:.1} ms", opt.query, i, elapsed);
-        if opt.debug {
-            pretty::print_batches(&batches)?;
-        }
-    }
-
-    let avg = millis.iter().sum::<f64>() / millis.len() as f64;
-    println!("Query {} avg time: {:.2} ms", opt.query, avg);
-
-    Ok(())
 }
 
 fn get_query_sql(query: usize) -> Result<String> {
@@ -358,24 +626,26 @@ async fn execute_query(
     if debug {
         println!("=== Logical plan ===\n{:?}\n", plan);
     }
+    let start = Instant::now();
     let plan = ctx.optimize(plan)?;
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
     if debug {
+        println!("Spent {:.2} ms optimizing\n", elapsed);
         println!("=== Optimized logical plan ===\n{:?}\n", plan);
     }
     let physical_plan = ctx.create_physical_plan(&plan).await?;
     if debug {
         println!(
             "=== Physical plan ===\n{}\n",
-            displayable(physical_plan.as_ref()).indent().to_string()
+            displayable(physical_plan.as_ref()).indent()
         );
     }
-    let result = collect(physical_plan.clone()).await?;
+    let runtime = ctx.state.lock().unwrap().runtime_env.clone();
+    let result = collect(physical_plan.clone(), runtime).await?;
     if debug {
         println!(
             "=== Physical plan with metrics ===\n{}\n",
-            DisplayableExecutionPlan::with_metrics(physical_plan.as_ref())
-                .indent()
-                .to_string()
+            DisplayableExecutionPlan::with_metrics(physical_plan.as_ref()).indent()
         );
         pretty::print_batches(&result)?;
     }
@@ -496,7 +766,7 @@ fn get_table(
         file_extension: extension.to_owned(),
         target_partitions,
         collect_stat: true,
-        partitions: vec![],
+        table_partition_cols: vec![],
     };
 
     Ok(Arc::new(ListingTable::new(
@@ -1058,6 +1328,7 @@ mod tests {
                 path: PathBuf::from(path.to_string()),
                 file_format: "tbl".to_string(),
                 mem_table: false,
+                tokomak: false,
             };
             let actual = benchmark_datafusion(opt).await?;
 

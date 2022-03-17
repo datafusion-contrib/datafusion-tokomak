@@ -64,11 +64,9 @@ pub fn create_window_expr(
             window_frame,
         )),
         WindowFunction::BuiltInWindowFunction(fun) => Arc::new(BuiltInWindowExpr::new(
-            fun.clone(),
             create_built_in_window_expr(fun, args, input_schema, name)?,
             partition_by,
             order_by,
-            window_frame,
         )),
     })
 }
@@ -176,31 +174,36 @@ pub(crate) fn find_ranges_in_range<'a>(
 mod tests {
     use super::*;
     use crate::datasource::object_store::local::LocalFileSystem;
+    use crate::execution::runtime_env::RuntimeEnv;
     use crate::physical_plan::aggregates::AggregateFunction;
     use crate::physical_plan::expressions::col;
-    use crate::physical_plan::file_format::CsvExec;
+    use crate::physical_plan::file_format::{CsvExec, PhysicalPlanConfig};
     use crate::physical_plan::{collect, Statistics};
     use crate::test::exec::{assert_strong_count_converges_to_zero, BlockingExec};
-    use crate::test::{self, aggr_test_schema, assert_is_pending};
+    use crate::test::{self, assert_is_pending};
+    use crate::test_util::{self, aggr_test_schema};
     use arrow::array::*;
     use arrow::datatypes::{DataType, Field, SchemaRef};
     use arrow::record_batch::RecordBatch;
     use futures::FutureExt;
 
     fn create_test_schema(partitions: usize) -> Result<(Arc<CsvExec>, SchemaRef)> {
-        let schema = test::aggr_test_schema();
+        let schema = test_util::aggr_test_schema();
         let (_, files) =
             test::create_partitioned_csv("aggregate_test_100.csv", partitions)?;
         let csv = CsvExec::new(
-            Arc::new(LocalFileSystem {}),
-            files,
-            Statistics::default(),
-            aggr_test_schema(),
+            PhysicalPlanConfig {
+                object_store: Arc::new(LocalFileSystem {}),
+                file_schema: aggr_test_schema(),
+                file_groups: files,
+                statistics: Statistics::default(),
+                projection: None,
+                batch_size: 1024,
+                limit: None,
+                table_partition_cols: vec![],
+            },
             true,
             b',',
-            None,
-            1024,
-            None,
         );
 
         let input = Arc::new(csv);
@@ -209,6 +212,7 @@ mod tests {
 
     #[tokio::test]
     async fn window_function() -> Result<()> {
+        let runtime = Arc::new(RuntimeEnv::default());
         let (input, schema) = create_test_schema(1)?;
 
         let window_exec = Arc::new(WindowAggExec::try_new(
@@ -245,7 +249,7 @@ mod tests {
             schema.clone(),
         )?);
 
-        let result: Vec<RecordBatch> = collect(window_exec).await?;
+        let result: Vec<RecordBatch> = collect(window_exec, runtime).await?;
         assert_eq!(result.len(), 1);
 
         let columns = result[0].columns();
@@ -269,6 +273,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_drop_cancel() -> Result<()> {
+        let runtime = Arc::new(RuntimeEnv::default());
         let schema =
             Arc::new(Schema::new(vec![Field::new("a", DataType::Float32, true)]));
 
@@ -288,7 +293,7 @@ mod tests {
             schema,
         )?);
 
-        let fut = collect(window_agg_exec);
+        let fut = collect(window_agg_exec, runtime);
         let mut fut = fut.boxed();
 
         assert_is_pending(&mut fut);

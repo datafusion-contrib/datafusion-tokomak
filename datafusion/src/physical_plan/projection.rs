@@ -21,6 +21,7 @@
 //! projection expressions. `SELECT` without `FROM` will only evaluate expressions.
 
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -36,8 +37,8 @@ use arrow::record_batch::RecordBatch;
 use super::expressions::Column;
 use super::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use super::{RecordBatchStream, SendableRecordBatchStream, Statistics};
+use crate::execution::runtime_env::RuntimeEnv;
 use async_trait::async_trait;
-
 use futures::stream::Stream;
 use futures::stream::StreamExt;
 
@@ -62,18 +63,24 @@ impl ProjectionExec {
     ) -> Result<Self> {
         let input_schema = input.schema();
 
-        let fields: Result<Vec<_>> = expr
+        let fields: Result<Vec<Field>> = expr
             .iter()
             .map(|(e, name)| {
-                Ok(Field::new(
+                let mut field = Field::new(
                     name,
                     e.data_type(&input_schema)?,
                     e.nullable(&input_schema)?,
-                ))
+                );
+                field.set_metadata(get_field_metadata(e, &input_schema));
+
+                Ok(field)
             })
             .collect();
 
-        let schema = Arc::new(Schema::new(fields?));
+        let schema = Arc::new(Schema::new_with_metadata(
+            fields?,
+            input_schema.metadata().clone(),
+        ));
 
         Ok(Self {
             expr,
@@ -130,11 +137,15 @@ impl ExecutionPlan for ProjectionExec {
         }
     }
 
-    async fn execute(&self, partition: usize) -> Result<SendableRecordBatchStream> {
+    async fn execute(
+        &self,
+        partition: usize,
+        runtime: Arc<RuntimeEnv>,
+    ) -> Result<SendableRecordBatchStream> {
         Ok(Box::pin(ProjectionStream {
             schema: self.schema.clone(),
             expr: self.expr.iter().map(|x| x.0.clone()).collect(),
-            input: self.input.execute(partition).await?,
+            input: self.input.execute(partition, runtime).await?,
             baseline_metrics: BaselineMetrics::new(&self.metrics, partition),
         }))
     }
@@ -174,6 +185,24 @@ impl ExecutionPlan for ProjectionExec {
             self.expr.iter().map(|(e, _)| Arc::clone(e)),
         )
     }
+}
+
+/// If e is a direct column reference, returns the field level
+/// metadata for that field, if any. Otherwise returns None
+fn get_field_metadata(
+    e: &Arc<dyn PhysicalExpr>,
+    input_schema: &Schema,
+) -> Option<BTreeMap<String, String>> {
+    let name = if let Some(column) = e.as_any().downcast_ref::<Column>() {
+        column.name()
+    } else {
+        return None;
+    };
+
+    input_schema
+        .field_with_name(name)
+        .ok()
+        .and_then(|f| f.metadata().as_ref().cloned())
 }
 
 fn stats_projection(
@@ -261,29 +290,34 @@ mod tests {
     use super::*;
     use crate::datasource::object_store::local::LocalFileSystem;
     use crate::physical_plan::expressions::{self, col};
-    use crate::physical_plan::file_format::CsvExec;
+    use crate::physical_plan::file_format::{CsvExec, PhysicalPlanConfig};
     use crate::scalar::ScalarValue;
-    use crate::test::{self, aggr_test_schema};
+    use crate::test::{self};
+    use crate::test_util;
     use futures::future;
 
     #[tokio::test]
     async fn project_first_column() -> Result<()> {
-        let schema = test::aggr_test_schema();
+        let runtime = Arc::new(RuntimeEnv::default());
+        let schema = test_util::aggr_test_schema();
 
         let partitions = 4;
         let (_, files) =
             test::create_partitioned_csv("aggregate_test_100.csv", partitions)?;
 
         let csv = CsvExec::new(
-            Arc::new(LocalFileSystem {}),
-            files,
-            Statistics::default(),
-            aggr_test_schema(),
+            PhysicalPlanConfig {
+                object_store: Arc::new(LocalFileSystem {}),
+                file_schema: Arc::clone(&schema),
+                file_groups: files,
+                statistics: Statistics::default(),
+                projection: None,
+                batch_size: 1024,
+                limit: None,
+                table_partition_cols: vec![],
+            },
             true,
             b',',
-            None,
-            1024,
-            None,
         );
 
         // pick column c1 and name it column c1 in the output schema
@@ -292,11 +326,16 @@ mod tests {
             Arc::new(csv),
         )?;
 
+        let col_field = projection.schema.field(0);
+        let col_metadata = col_field.metadata().clone().unwrap().clone();
+        let data: &str = &col_metadata["testing"];
+        assert_eq!(data, "test");
+
         let mut partition_count = 0;
         let mut row_count = 0;
         for partition in 0..projection.output_partitioning().partition_count() {
             partition_count += 1;
-            let stream = projection.execute(partition).await?;
+            let stream = projection.execute(partition, runtime.clone()).await?;
 
             row_count += stream
                 .map(|batch| {
