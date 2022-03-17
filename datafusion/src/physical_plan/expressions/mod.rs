@@ -26,13 +26,13 @@ use arrow::compute::kernels::sort::{SortColumn, SortOptions};
 use arrow::record_batch::RecordBatch;
 
 mod approx_distinct;
+mod approx_percentile_cont;
 mod array_agg;
 mod average;
 #[macro_use]
 mod binary;
 mod case;
 mod cast;
-pub(crate) mod coercion;
 mod column;
 mod count;
 mod cume_dist;
@@ -46,6 +46,7 @@ mod literal;
 mod min_max;
 mod correlation;
 mod covariance;
+mod distinct_expressions;
 mod negative;
 mod not;
 mod nth_value;
@@ -64,6 +65,9 @@ pub mod helpers {
 }
 
 pub use approx_distinct::ApproxDistinct;
+pub use approx_percentile_cont::{
+    is_approx_percentile_cont_supported_arg_type, ApproxPercentileCont,
+};
 pub use array_agg::ArrayAgg;
 pub(crate) use average::is_avg_support_arg_type;
 pub use average::{avg_return_type, Avg, AvgAccumulator};
@@ -81,6 +85,7 @@ pub(crate) use covariance::{
     covariance_return_type, is_covariance_support_arg_type, Covariance, CovariancePop,
 };
 pub use cume_dist::cume_dist;
+pub use distinct_expressions::{DistinctArrayAgg, DistinctCount};
 pub use get_indexed_field::GetIndexedFieldExpr;
 pub use in_list::{in_list, InListExpr};
 pub use is_not_null::{is_not_null, IsNotNullExpr};

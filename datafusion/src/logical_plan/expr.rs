@@ -20,10 +20,12 @@
 
 pub use super::Operator;
 use crate::error::{DataFusionError, Result};
+use crate::execution::context::ExecutionProps;
 use crate::field_util::get_indexed_field;
 use crate::logical_plan::{
     plan::Aggregate, window_frames, DFField, DFSchema, LogicalPlan,
 };
+use crate::optimizer::simplify_expressions::{ConstEvaluator, Simplifier};
 use crate::physical_plan::functions::Volatility;
 use crate::physical_plan::{
     aggregates, expressions::binary_operator_data_type, functions, udf::ScalarUDF,
@@ -390,23 +392,65 @@ impl PartialOrd for Expr {
     }
 }
 
+/// Provides schema information needed by [Expr] methods such as
+/// [Expr::nullable] and [Expr::data_type].
+///
+/// Note that this trait is implemented for &[DFSchema] which is
+/// widely used in the DataFusion codebase.
+pub trait ExprSchema {
+    /// Is this column reference nullable?
+    fn nullable(&self, col: &Column) -> Result<bool>;
+
+    /// What is the datatype of this column?
+    fn data_type(&self, col: &Column) -> Result<&DataType>;
+}
+
+// Implement `ExprSchema` for `Arc<DFSchema>`
+impl<P: AsRef<DFSchema>> ExprSchema for P {
+    fn nullable(&self, col: &Column) -> Result<bool> {
+        self.as_ref().nullable(col)
+    }
+
+    fn data_type(&self, col: &Column) -> Result<&DataType> {
+        self.as_ref().data_type(col)
+    }
+}
+
+impl ExprSchema for DFSchema {
+    fn nullable(&self, col: &Column) -> Result<bool> {
+        Ok(self.field_from_column(col)?.is_nullable())
+    }
+
+    fn data_type(&self, col: &Column) -> Result<&DataType> {
+        Ok(self.field_from_column(col)?.data_type())
+    }
+}
+
 impl Expr {
-    /// Returns the [arrow::datatypes::DataType] of the expression based on [arrow::datatypes::Schema].
+    /// Returns the [arrow::datatypes::DataType] of the expression
+    /// based on [ExprSchema]
+    ///
+    /// Note: [DFSchema] implements [ExprSchema].
     ///
     /// # Errors
     ///
-    /// This function errors when it is not possible to compute its [arrow::datatypes::DataType].
-    /// This happens when e.g. the expression refers to a column that does not exist in the schema, or when
-    /// the expression is incorrectly typed (e.g. `[utf8] + [bool]`).
-    pub fn get_type(&self, schema: &DFSchema) -> Result<DataType> {
+    /// This function errors when it is not possible to compute its
+    /// [arrow::datatypes::DataType].  This happens when e.g. the
+    /// expression refers to a column that does not exist in the
+    /// schema, or when the expression is incorrectly typed
+    /// (e.g. `[utf8] + [bool]`).
+    pub fn get_type<S: ExprSchema>(&self, schema: &S) -> Result<DataType> {
         match self {
-            Expr::Alias(expr, _) => expr.get_type(schema),
-            Expr::Column(c) => Ok(schema.field_from_column(c)?.data_type().clone()),
+            Expr::Alias(expr, _) | Expr::Sort { expr, .. } | Expr::Negative(expr) => {
+                expr.get_type(schema)
+            }
+            Expr::Column(c) => Ok(schema.data_type(c)?.clone()),
             Expr::ScalarVariable(_) => Ok(DataType::Utf8),
             Expr::Literal(l) => Ok(l.get_datatype()),
             Expr::Case { when_then_expr, .. } => when_then_expr[0].1.get_type(schema),
-            Expr::Cast { data_type, .. } => Ok(data_type.clone()),
-            Expr::TryCast { data_type, .. } => Ok(data_type.clone()),
+            Expr::Cast { data_type, .. } | Expr::TryCast { data_type, .. } => {
+                Ok(data_type.clone())
+            }
             Expr::ScalarUDF { fun, args } => {
                 let data_types = args
                     .iter()
@@ -442,10 +486,11 @@ impl Expr {
                     .collect::<Result<Vec<_>>>()?;
                 Ok((fun.return_type)(&data_types)?.as_ref().clone())
             }
-            Expr::Not(_) => Ok(DataType::Boolean),
-            Expr::Negative(expr) => expr.get_type(schema),
-            Expr::IsNull(_) => Ok(DataType::Boolean),
-            Expr::IsNotNull(_) => Ok(DataType::Boolean),
+            Expr::Not(_)
+            | Expr::IsNull(_)
+            | Expr::Between { .. }
+            | Expr::InList { .. }
+            | Expr::IsNotNull(_) => Ok(DataType::Boolean),
             Expr::BinaryExpr {
                 ref left,
                 ref right,
@@ -455,9 +500,6 @@ impl Expr {
                 op,
                 &right.get_type(schema)?,
             ),
-            Expr::Sort { ref expr, .. } => expr.get_type(schema),
-            Expr::Between { .. } => Ok(DataType::Boolean),
-            Expr::InList { .. } => Ok(DataType::Boolean),
             Expr::Wildcard => Err(DataFusionError::Internal(
                 "Wildcard expressions are not valid in a logical query plan".to_owned(),
             )),
@@ -469,18 +511,25 @@ impl Expr {
         }
     }
 
-    /// Returns the nullability of the expression based on [arrow::datatypes::Schema].
+    /// Returns the nullability of the expression based on [ExprSchema].
+    ///
+    /// Note: [DFSchema] implements [ExprSchema].
     ///
     /// # Errors
     ///
-    /// This function errors when it is not possible to compute its nullability.
-    /// This happens when the expression refers to a column that does not exist in the schema.
-    pub fn nullable(&self, input_schema: &DFSchema) -> Result<bool> {
+    /// This function errors when it is not possible to compute its
+    /// nullability.  This happens when the expression refers to a
+    /// column that does not exist in the schema.
+    pub fn nullable<S: ExprSchema>(&self, input_schema: &S) -> Result<bool> {
         match self {
-            Expr::Alias(expr, _) => expr.nullable(input_schema),
-            Expr::Column(c) => Ok(input_schema.field_from_column(c)?.is_nullable()),
+            Expr::Alias(expr, _)
+            | Expr::Not(expr)
+            | Expr::Negative(expr)
+            | Expr::Sort { expr, .. }
+            | Expr::Between { expr, .. }
+            | Expr::InList { expr, .. } => expr.nullable(input_schema),
+            Expr::Column(c) => input_schema.nullable(c),
             Expr::Literal(value) => Ok(value.is_null()),
-            Expr::ScalarVariable(_) => Ok(true),
             Expr::Case {
                 when_then_expr,
                 else_expr,
@@ -500,24 +549,19 @@ impl Expr {
                 }
             }
             Expr::Cast { expr, .. } => expr.nullable(input_schema),
-            Expr::TryCast { .. } => Ok(true),
-            Expr::ScalarFunction { .. } => Ok(true),
-            Expr::ScalarUDF { .. } => Ok(true),
-            Expr::WindowFunction { .. } => Ok(true),
-            Expr::AggregateFunction { .. } => Ok(true),
-            Expr::AggregateUDF { .. } => Ok(true),
-            Expr::Not(expr) => expr.nullable(input_schema),
-            Expr::Negative(expr) => expr.nullable(input_schema),
-            Expr::IsNull(_) => Ok(false),
-            Expr::IsNotNull(_) => Ok(false),
+            Expr::ScalarVariable(_)
+            | Expr::TryCast { .. }
+            | Expr::ScalarFunction { .. }
+            | Expr::ScalarUDF { .. }
+            | Expr::WindowFunction { .. }
+            | Expr::AggregateFunction { .. }
+            | Expr::AggregateUDF { .. } => Ok(true),
+            Expr::IsNull(_) | Expr::IsNotNull(_) => Ok(false),
             Expr::BinaryExpr {
                 ref left,
                 ref right,
                 ..
             } => Ok(left.nullable(input_schema)? || right.nullable(input_schema)?),
-            Expr::Sort { ref expr, .. } => expr.nullable(input_schema),
-            Expr::Between { ref expr, .. } => expr.nullable(input_schema),
-            Expr::InList { ref expr, .. } => expr.nullable(input_schema),
             Expr::Wildcard => Err(DataFusionError::Internal(
                 "Wildcard expressions are not valid in a logical query plan".to_owned(),
             )),
@@ -559,7 +603,11 @@ impl Expr {
     ///
     /// This function errors when it is impossible to cast the
     /// expression to the target [arrow::datatypes::DataType].
-    pub fn cast_to(self, cast_to_type: &DataType, schema: &DFSchema) -> Result<Expr> {
+    pub fn cast_to<S: ExprSchema>(
+        self,
+        cast_to_type: &DataType,
+        schema: &S,
+    ) -> Result<Expr> {
         // TODO(kszucs): most of the operations do not validate the type correctness
         // like all of the binary expressions below. Perhaps Expr should track the
         // type of the expression?
@@ -723,18 +771,23 @@ impl Expr {
 
         // recurse (and cover all expression types)
         let visitor = match self {
-            Expr::Alias(expr, _) => expr.accept(visitor),
-            Expr::Column(_) => Ok(visitor),
-            Expr::ScalarVariable(..) => Ok(visitor),
-            Expr::Literal(..) => Ok(visitor),
+            Expr::Alias(expr, _)
+            | Expr::Not(expr)
+            | Expr::IsNotNull(expr)
+            | Expr::IsNull(expr)
+            | Expr::Negative(expr)
+            | Expr::Cast { expr, .. }
+            | Expr::TryCast { expr, .. }
+            | Expr::Sort { expr, .. }
+            | Expr::GetIndexedField { expr, .. } => expr.accept(visitor),
+            Expr::Column(_)
+            | Expr::ScalarVariable(_)
+            | Expr::Literal(_)
+            | Expr::Wildcard => Ok(visitor),
             Expr::BinaryExpr { left, right, .. } => {
                 let visitor = left.accept(visitor)?;
                 right.accept(visitor)
             }
-            Expr::Not(expr) => expr.accept(visitor),
-            Expr::IsNotNull(expr) => expr.accept(visitor),
-            Expr::IsNull(expr) => expr.accept(visitor),
-            Expr::Negative(expr) => expr.accept(visitor),
             Expr::Between {
                 expr, low, high, ..
             } => {
@@ -765,13 +818,10 @@ impl Expr {
                     Ok(visitor)
                 }
             }
-            Expr::Cast { expr, .. } => expr.accept(visitor),
-            Expr::TryCast { expr, .. } => expr.accept(visitor),
-            Expr::Sort { expr, .. } => expr.accept(visitor),
-            Expr::ScalarFunction { args, .. } => args
-                .iter()
-                .try_fold(visitor, |visitor, arg| arg.accept(visitor)),
-            Expr::ScalarUDF { args, .. } => args
+            Expr::ScalarFunction { args, .. }
+            | Expr::ScalarUDF { args, .. }
+            | Expr::AggregateFunction { args, .. }
+            | Expr::AggregateUDF { args, .. } => args
                 .iter()
                 .try_fold(visitor, |visitor, arg| arg.accept(visitor)),
             Expr::WindowFunction {
@@ -791,19 +841,11 @@ impl Expr {
                     .try_fold(visitor, |visitor, arg| arg.accept(visitor))?;
                 Ok(visitor)
             }
-            Expr::AggregateFunction { args, .. } => args
-                .iter()
-                .try_fold(visitor, |visitor, arg| arg.accept(visitor)),
-            Expr::AggregateUDF { args, .. } => args
-                .iter()
-                .try_fold(visitor, |visitor, arg| arg.accept(visitor)),
             Expr::InList { expr, list, .. } => {
                 let visitor = expr.accept(visitor)?;
                 list.iter()
                     .try_fold(visitor, |visitor, arg| arg.accept(visitor))
             }
-            Expr::Wildcard => Ok(visitor),
-            Expr::GetIndexedField { ref expr, .. } => expr.accept(visitor),
         }?;
 
         visitor.post_visit(self)
@@ -977,6 +1019,58 @@ impl Expr {
             Ok(expr)
         }
     }
+
+    /// Simplifies this [`Expr`]`s as much as possible, evaluating
+    /// constants and applying algebraic simplifications
+    ///
+    /// # Example:
+    /// `b > 2 AND b > 2`
+    /// can be written to
+    /// `b > 2`
+    ///
+    /// ```
+    /// use datafusion::logical_plan::*;
+    /// use datafusion::error::Result;
+    /// use datafusion::execution::context::ExecutionProps;
+    ///
+    /// /// Simple implementation that provides `Simplifier` the information it needs
+    /// #[derive(Default)]
+    /// struct Info {
+    ///   execution_props: ExecutionProps,
+    /// };
+    ///
+    /// impl SimplifyInfo for Info {
+    ///   fn is_boolean_type(&self, expr: &Expr) -> Result<bool> {
+    ///     Ok(false)
+    ///   }
+    ///   fn nullable(&self, expr: &Expr) -> Result<bool> {
+    ///     Ok(true)
+    ///   }
+    ///   fn execution_props(&self) -> &ExecutionProps {
+    ///     &self.execution_props
+    ///   }
+    /// }
+    ///
+    /// // b < 2
+    /// let b_lt_2 = col("b").gt(lit(2));
+    ///
+    /// // (b < 2) OR (b < 2)
+    /// let expr = b_lt_2.clone().or(b_lt_2.clone());
+    ///
+    /// // (b < 2) OR (b < 2) --> (b < 2)
+    /// let expr = expr.simplify(&Info::default()).unwrap();
+    /// assert_eq!(expr, b_lt_2);
+    /// ```
+    pub fn simplify<S: SimplifyInfo>(self, info: &S) -> Result<Self> {
+        let mut rewriter = Simplifier::new(info);
+        let mut const_evaluator = ConstEvaluator::new(info.execution_props());
+
+        // TODO iterate until no changes are made during rewrite
+        // (evaluating constants can enable new simplifications and
+        // simplifications can enable new constant evaluation)
+        // https://github.com/apache/arrow-datafusion/issues/1160
+        self.rewrite(&mut const_evaluator)?.rewrite(&mut rewriter)
+    }
 }
 
 impl Not for Expr {
@@ -1105,6 +1199,20 @@ pub trait ExprRewriter: Sized {
     fn mutate(&mut self, expr: Expr) -> Result<Expr>;
 }
 
+/// The information necessary to apply algebraic simplification to an
+/// [Expr]. See [SimplifyContext] for one implementation
+pub trait SimplifyInfo {
+    /// returns true if this Expr has boolean type
+    fn is_boolean_type(&self, expr: &Expr) -> Result<bool>;
+
+    /// returns true of this expr is nullable (could possibly be NULL)
+    fn nullable(&self, expr: &Expr) -> Result<bool>;
+
+    /// Returns details needed for partial expression evaluation
+    fn execution_props(&self) -> &ExecutionProps;
+}
+
+/// Helper struct for building [Expr::Case]
 pub struct CaseBuilder {
     expr: Option<Box<Expr>>,
     when_expr: Vec<Expr>,
@@ -1660,6 +1768,15 @@ pub fn approx_distinct(expr: Expr) -> Expr {
     }
 }
 
+/// Calculate an approximation of the specified `percentile` for `expr`.
+pub fn approx_percentile_cont(expr: Expr, percentile: Expr) -> Expr {
+    Expr::AggregateFunction {
+        fun: aggregates::AggregateFunction::ApproxPercentileCont,
+        distinct: false,
+        args: vec![expr, percentile],
+    }
+}
+
 // TODO(kszucs): this seems buggy, unary_scalar_expr! is used for many
 // varying arity functions
 /// Create an convenience function representing a unary scalar function
@@ -2125,6 +2242,20 @@ pub fn exprlist_to_fields<'a>(
     expr.into_iter().map(|e| e.to_field(input_schema)).collect()
 }
 
+/// Calls a named built in function
+/// ```
+/// use datafusion::logical_plan::*;
+///
+/// // create the expression sin(x) < 0.2
+/// let expr = call_fn("sin", vec![col("x")]).unwrap().lt(lit(0.2));
+/// ```
+pub fn call_fn(name: impl AsRef<str>, args: Vec<Expr>) -> Result<Expr> {
+    match name.as_ref().parse::<functions::BuiltinScalarFunction>() {
+        Ok(fun) => Ok(Expr::ScalarFunction { fun, args }),
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{col, lit, when};
@@ -2492,5 +2623,58 @@ mod tests {
         let result =
             combine_filters(&[filter1.clone(), filter2.clone(), filter3.clone()]);
         assert_eq!(result, Some(and(and(filter1, filter2), filter3)));
+    }
+
+    #[test]
+    fn expr_schema_nullability() {
+        let expr = col("foo").eq(lit(1));
+        assert!(!expr.nullable(&MockExprSchema::new()).unwrap());
+        assert!(expr
+            .nullable(&MockExprSchema::new().with_nullable(true))
+            .unwrap());
+    }
+
+    #[test]
+    fn expr_schema_data_type() {
+        let expr = col("foo");
+        assert_eq!(
+            DataType::Utf8,
+            expr.get_type(&MockExprSchema::new().with_data_type(DataType::Utf8))
+                .unwrap()
+        );
+    }
+
+    struct MockExprSchema {
+        nullable: bool,
+        data_type: DataType,
+    }
+
+    impl MockExprSchema {
+        fn new() -> Self {
+            Self {
+                nullable: false,
+                data_type: DataType::Null,
+            }
+        }
+
+        fn with_nullable(mut self, nullable: bool) -> Self {
+            self.nullable = nullable;
+            self
+        }
+
+        fn with_data_type(mut self, data_type: DataType) -> Self {
+            self.data_type = data_type;
+            self
+        }
+    }
+
+    impl ExprSchema for MockExprSchema {
+        fn nullable(&self, _col: &Column) -> Result<bool> {
+            Ok(self.nullable)
+        }
+
+        fn data_type(&self, _col: &Column) -> Result<&DataType> {
+            Ok(&self.data_type)
+        }
     }
 }

@@ -15,14 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use clap::{crate_version, App, Arg};
+use clap::{crate_version, Command, Parser, Arg};
 use datafusion::error::Result;
 use datafusion::execution::context::ExecutionConfig;
+use datafusion_cli::print_format::all_print_formats;
 use datafusion_cli::{
-    context::Context,
-    exec,
-    print_format::{all_print_formats, PrintFormat},
-    print_options::PrintOptions,
+    context::Context, exec, print_format::PrintFormat, print_options::PrintOptions,
     DATAFUSION_CLI_VERSION,
 };
 use std::env;
@@ -30,17 +28,62 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
+#[derive(Debug, Parser, PartialEq)]
+#[clap(author, version, about, long_about= None)]
+struct Args {
+    #[clap(
+        short = 'p',
+        long,
+        help = "Path to your data, default to current directory",
+        validator(is_valid_data_dir)
+    )]
+    data_path: Option<String>,
+
+    #[clap(
+        short = 'c',
+        long,
+        help = "The batch size of each query, or use DataFusion default",
+        validator(is_valid_batch_size)
+    )]
+    batch_size: Option<usize>,
+
+    #[clap(
+        short,
+        long,
+        multiple_values = true,
+        help = "Execute commands from file(s), then exit",
+        validator(is_valid_file)
+    )]
+    file: Vec<String>,
+
+    #[clap(long, arg_enum, default_value_t = PrintFormat::Table)]
+    format: PrintFormat,
+
+    #[clap(long, help = "Ballista scheduler host")]
+    host: Option<String>,
+
+    #[clap(long, help = "Ballista scheduler port")]
+    port: Option<u16>,
+
+    #[clap(
+        short,
+        long,
+        help = "Reduce printing other than the results and work quietly"
+    )]
+    quiet: bool,
+}
+
 #[tokio::main]
 pub async fn main() -> Result<()> {
-    let owned_print_formats = all_print_formats()
+    let owned_print_formats: Vec<_> = all_print_formats()
         .iter()
         .map(|format| format.to_string())
-        .collect::<Vec<_>>();
+        .collect();
     let all_print_formats = owned_print_formats
         .iter()
         .map(|s| s.as_str())
         .collect::<Vec<_>>();
-    let mut app = App::new("DataFusion")
+    let mut app = Command::new("DataFusion")
         .version(crate_version!())
         .about(
             "DataFusion is an in-memory query engine that uses Apache Arrow \
@@ -48,32 +91,32 @@ pub async fn main() -> Result<()> {
              Parquet files as well as querying directly against in-memory data.",
         )
         .arg(
-            Arg::with_name("data-path")
+            Arg::new("data-path")
                 .help("Path to your data, default to current directory")
-                .short("p")
+                .short('p')
                 .long("data-path")
                 .validator(is_valid_data_dir)
                 .takes_value(true),
         )
         .arg(
-            Arg::with_name("batch-size")
+            Arg::new("batch-size")
                 .help("The batch size of each query, or use DataFusion default")
-                .short("c")
+                .short('c')
                 .long("batch-size")
                 .validator(is_valid_batch_size)
                 .takes_value(true),
         )
         .arg(
-            Arg::with_name("file")
+            Arg::new("file")
                 .help("Execute commands from file(s), then exit")
-                .short("f")
+                .short('f')
                 .long("file")
-                .multiple(true)
+                .multiple_values(true)
                 .validator(is_valid_file)
                 .takes_value(true),
         )
         .arg(
-            Arg::with_name("format")
+            Arg::new("format")
                 .help("Output format")
                 .long("format")
                 .default_value("table")
@@ -81,29 +124,29 @@ pub async fn main() -> Result<()> {
                 .takes_value(true),
         )
         .arg(
-            Arg::with_name("host")
+            Arg::new("host")
                 .help("Ballista scheduler host")
                 .long("host")
                 .takes_value(true),
         )
         .arg(
-            Arg::with_name("port")
+            Arg::new("port")
                 .help("Ballista scheduler port")
                 .long("port")
                 .takes_value(true),
         )
         .arg(
-            Arg::with_name("quiet")
+            Arg::new("quiet")
                 .help("Reduce printing other than the results and work quietly")
-                .short("q")
+                .short('q')
                 .long("quiet")
                 .takes_value(false),
         );
     if cfg!(feature = "experimental-tokomak") {
         app = app.arg(
-            Arg::with_name("tokomak")
+            Arg::new("tokomak")
                 .help("Enables the experimental tokomak optimizer")
-                .short("t")
+                .short('t')
                 .long("tokomak")
                 .takes_value(false),
         );
@@ -116,41 +159,37 @@ pub async fn main() -> Result<()> {
     if !quiet {
         println!("DataFusion CLI v{}\n", DATAFUSION_CLI_VERSION);
     }
+    let args = Args::parse();
 
-    let host = matches.value_of("host");
-    let port = matches
-        .value_of("port")
-        .and_then(|port| port.parse::<u16>().ok());
+    if !args.quiet {
+        println!("DataFusion CLI v{}", DATAFUSION_CLI_VERSION);
+    }
 
-    if let Some(path) = matches.value_of("data-path") {
+    if let Some(ref path) = args.data_path {
         let p = Path::new(path);
         env::set_current_dir(&p).unwrap();
     };
 
     let mut execution_config = exec_context(tokomak);
 
-    if let Some(batch_size) = matches
-        .value_of("batch-size")
-        .and_then(|size| size.parse::<usize>().ok())
-    {
+    if let Some(batch_size) = args.batch_size {
         execution_config = execution_config.with_batch_size(batch_size);
     };
 
-    let mut ctx: Context = match (host, port) {
-        (Some(h), Some(p)) => Context::new_remote(h, p)?,
+    let mut ctx: Context = match (args.host, args.port) {
+        (Some(ref h), Some(p)) => Context::new_remote(h, p)?,
         _ => Context::new_local(&execution_config),
     };
 
-    let format = matches
-        .value_of("format")
-        .expect("No format is specified")
-        .parse::<PrintFormat>()
-        .expect("Invalid format");
+    let mut print_options = PrintOptions {
+        format: args.format,
+        quiet: args.quiet,
+    };
 
-    let mut print_options = PrintOptions { format, quiet };
-
-    if let Some(file_paths) = matches.values_of("file") {
-        let files = file_paths
+    let files = args.file;
+    if !files.is_empty() {
+        let files = files
+            .into_iter()
             .map(|file_path| File::open(file_path).unwrap())
             .collect::<Vec<_>>();
         for file in files {
@@ -239,23 +278,23 @@ fn exec_context(_tokomak: bool) -> ExecutionConfig {
     ExecutionConfig::new().with_information_schema(true)
 }
 
-fn is_valid_file(dir: String) -> std::result::Result<(), String> {
-    if Path::new(&dir).is_file() {
+fn is_valid_file(dir: &str) -> std::result::Result<(), String> {
+    if Path::new(dir).is_file() {
         Ok(())
     } else {
         Err(format!("Invalid file '{}'", dir))
     }
 }
 
-fn is_valid_data_dir(dir: String) -> std::result::Result<(), String> {
-    if Path::new(&dir).is_dir() {
+fn is_valid_data_dir(dir: &str) -> std::result::Result<(), String> {
+    if Path::new(dir).is_dir() {
         Ok(())
     } else {
         Err(format!("Invalid data directory '{}'", dir))
     }
 }
 
-fn is_valid_batch_size(size: String) -> std::result::Result<(), String> {
+fn is_valid_batch_size(size: &str) -> std::result::Result<(), String> {
     match size.parse::<usize>() {
         Ok(size) if size > 0 => Ok(()),
         _ => Err(format!("Invalid batch size '{}'", size)),

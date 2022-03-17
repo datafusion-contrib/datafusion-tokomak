@@ -54,6 +54,8 @@ use datafusion::{
     },
 };
 
+use datafusion::datasource::file_format::csv::DEFAULT_CSV_EXTENSION;
+use datafusion::datasource::file_format::parquet::DEFAULT_PARQUET_EXTENSION;
 use structopt::StructOpt;
 
 #[cfg(feature = "snmalloc")]
@@ -350,7 +352,7 @@ async fn benchmark_datafusion(opt: DataFusionBenchmarkOpt) -> Result<Vec<RecordB
         .with_batch_size(opt.batch_size);
     config = with_optimizers_datafusion(config, &opt);
     let mut ctx = ExecutionContext::with_config(config);
-    let runtime = ctx.state.lock().unwrap().runtime_env.clone();
+    let runtime = ctx.state.lock().runtime_env.clone();
 
     // register tables
     for table in TABLES {
@@ -364,13 +366,9 @@ async fn benchmark_datafusion(opt: DataFusionBenchmarkOpt) -> Result<Vec<RecordB
             println!("Loading table '{}' into memory", table);
             let start = Instant::now();
 
-            let memtable = MemTable::load(
-                table_provider,
-                opt.batch_size,
-                Some(opt.partitions),
-                runtime.clone(),
-            )
-            .await?;
+            let memtable =
+                MemTable::load(table_provider, Some(opt.partitions), runtime.clone())
+                    .await?;
             println!(
                 "Loaded table '{}' into memory in {} ms",
                 table,
@@ -640,7 +638,7 @@ async fn execute_query(
             displayable(physical_plan.as_ref()).indent()
         );
     }
-    let runtime = ctx.state.lock().unwrap().runtime_env.clone();
+    let runtime = ctx.state.lock().runtime_env.clone();
     let result = collect(physical_plan.clone(), runtime).await?;
     if debug {
         println!(
@@ -747,13 +745,13 @@ fn get_table(
                     .with_delimiter(b',')
                     .with_has_header(true);
 
-                (Arc::new(format), path, ".csv")
+                (Arc::new(format), path, DEFAULT_CSV_EXTENSION)
             }
             "parquet" => {
                 let path = format!("{}/{}", path, table);
                 let format = ParquetFormat::default().with_enable_pruning(true);
 
-                (Arc::new(format), path, ".parquet")
+                (Arc::new(format), path, DEFAULT_PARQUET_EXTENSION)
             }
             other => {
                 unimplemented!("Invalid file format '{}'", other);

@@ -27,12 +27,11 @@
 //! * Return type: a function `(arg_types) -> return_type`. E.g. for min, ([f32]) -> f32, ([f64]) -> f64.
 
 use super::{
-    functions::{Signature, Volatility},
+    functions::{Signature, TypeSignature, Volatility},
     Accumulator, AggregateExpr, PhysicalExpr,
 };
 use crate::error::{DataFusionError, Result};
 use crate::physical_plan::coercion_rule::aggregate_rule::{coerce_exprs, coerce_types};
-use crate::physical_plan::distinct_expressions;
 use crate::physical_plan::expressions;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use expressions::{
@@ -81,6 +80,8 @@ pub enum AggregateFunction {
     CovariancePop,
     /// Correlation
     Correlation,
+    /// Approximate continuous percentile function
+    ApproxPercentileCont,
 }
 
 impl fmt::Display for AggregateFunction {
@@ -111,6 +112,7 @@ impl FromStr for AggregateFunction {
             "covar_samp" => AggregateFunction::Covariance,
             "covar_pop" => AggregateFunction::CovariancePop,
             "corr" => AggregateFunction::Correlation,
+            "approx_percentile_cont" => AggregateFunction::ApproxPercentileCont,
             _ => {
                 return Err(DataFusionError::Plan(format!(
                     "There is no built-in function named {}",
@@ -158,6 +160,7 @@ pub fn return_type(
             coerced_data_types[0].clone(),
             true,
         )))),
+        AggregateFunction::ApproxPercentileCont => Ok(coerced_data_types[0].clone()),
     }
 }
 
@@ -198,14 +201,12 @@ pub fn create_aggregate_expr(
             name,
             return_type,
         )),
-        (AggregateFunction::Count, true) => {
-            Arc::new(distinct_expressions::DistinctCount::new(
-                coerced_exprs_types,
-                coerced_phy_exprs,
-                name,
-                return_type,
-            ))
-        }
+        (AggregateFunction::Count, true) => Arc::new(expressions::DistinctCount::new(
+            coerced_exprs_types,
+            coerced_phy_exprs,
+            name,
+            return_type,
+        )),
         (AggregateFunction::Sum, false) => Arc::new(expressions::Sum::new(
             coerced_phy_exprs[0].clone(),
             name,
@@ -229,9 +230,11 @@ pub fn create_aggregate_expr(
             coerced_exprs_types[0].clone(),
         )),
         (AggregateFunction::ArrayAgg, true) => {
-            return Err(DataFusionError::NotImplemented(
-                "ARRAY_AGG(DISTINCT) aggregations are not available".to_string(),
-            ));
+            Arc::new(expressions::DistinctArrayAgg::new(
+                coerced_phy_exprs[0].clone(),
+                name,
+                coerced_exprs_types[0].clone(),
+            ))
         }
         (AggregateFunction::Min, _) => Arc::new(expressions::Min::new(
             coerced_phy_exprs[0].clone(),
@@ -332,6 +335,20 @@ pub fn create_aggregate_expr(
                 "CORR(DISTINCT) aggregations are not available".to_string(),
             ));
         }
+        (AggregateFunction::ApproxPercentileCont, false) => {
+            Arc::new(expressions::ApproxPercentileCont::new(
+                // Pass in the desired percentile expr
+                coerced_phy_exprs,
+                name,
+                return_type,
+            )?)
+        }
+        (AggregateFunction::ApproxPercentileCont, true) => {
+            return Err(DataFusionError::NotImplemented(
+                "approx_percentile_cont(DISTINCT) aggregations are not available"
+                    .to_string(),
+            ));
+        }
     })
 }
 
@@ -360,7 +377,7 @@ static TIMESTAMPS: &[DataType] = &[
 static DATES: &[DataType] = &[DataType::Date32, DataType::Date64];
 
 /// the signatures supported by the function `fun`.
-pub fn signature(fun: &AggregateFunction) -> Signature {
+pub(super) fn signature(fun: &AggregateFunction) -> Signature {
     // note: the physical expression must accept the type returned by this function or the execution panics.
     match fun {
         AggregateFunction::Count
@@ -390,19 +407,25 @@ pub fn signature(fun: &AggregateFunction) -> Signature {
         AggregateFunction::Correlation => {
             Signature::uniform(2, NUMERICS.to_vec(), Volatility::Immutable)
         }
+        AggregateFunction::ApproxPercentileCont => Signature::one_of(
+            // Accept any numeric value paired with a float64 percentile
+            NUMERICS
+                .iter()
+                .map(|t| TypeSignature::Exact(vec![t.clone(), DataType::Float64]))
+                .collect(),
+            Volatility::Immutable,
+        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::DataFusionError::NotImplemented;
-    use crate::error::Result;
-    use crate::physical_plan::distinct_expressions::DistinctCount;
     use crate::physical_plan::expressions::{
-        ApproxDistinct, ArrayAgg, Avg, Correlation, Count, Covariance, Max, Min, Stddev,
-        Sum, Variance,
+        ApproxDistinct, ApproxPercentileCont, ArrayAgg, Avg, Correlation, Count,
+        Covariance, DistinctArrayAgg, DistinctCount, Max, Min, Stddev, Sum, Variance,
     };
+    use crate::{error::Result, scalar::ScalarValue};
 
     #[test]
     fn test_count_arragg_approx_expr() -> Result<()> {
@@ -475,47 +498,98 @@ mod tests {
                     &input_phy_exprs[0..1],
                     &input_schema,
                     "c1",
-                );
+                )?;
                 match fun {
                     AggregateFunction::Count => {
-                        let result_agg_phy_exprs_distinct = result_distinct?;
-                        assert!(result_agg_phy_exprs_distinct
-                            .as_any()
-                            .is::<DistinctCount>());
-                        assert_eq!("c1", result_agg_phy_exprs_distinct.name());
+                        assert!(result_distinct.as_any().is::<DistinctCount>());
+                        assert_eq!("c1", result_distinct.name());
                         assert_eq!(
                             Field::new("c1", DataType::UInt64, true),
-                            result_agg_phy_exprs_distinct.field().unwrap()
+                            result_distinct.field().unwrap()
                         );
                     }
                     AggregateFunction::ApproxDistinct => {
-                        let result_agg_phy_exprs_distinct = result_distinct?;
-                        assert!(result_agg_phy_exprs_distinct
-                            .as_any()
-                            .is::<ApproxDistinct>());
-                        assert_eq!("c1", result_agg_phy_exprs_distinct.name());
+                        assert!(result_distinct.as_any().is::<ApproxDistinct>());
+                        assert_eq!("c1", result_distinct.name());
                         assert_eq!(
                             Field::new("c1", DataType::UInt64, false),
-                            result_agg_phy_exprs_distinct.field().unwrap()
+                            result_distinct.field().unwrap()
                         );
                     }
-                    AggregateFunction::ArrayAgg => match result_distinct {
-                        Err(NotImplemented(s)) => {
-                            assert_eq!(
-                                s,
-                                "ARRAY_AGG(DISTINCT) aggregations are not available"
-                                    .to_string()
-                            );
-                        }
-                        _ => {
-                            unreachable!()
-                        }
-                    },
+                    AggregateFunction::ArrayAgg => {
+                        assert!(result_distinct.as_any().is::<DistinctArrayAgg>());
+                        assert_eq!("c1", result_distinct.name());
+                        assert_eq!(
+                            Field::new(
+                                "c1",
+                                DataType::List(Box::new(Field::new(
+                                    "item",
+                                    data_type.clone(),
+                                    true
+                                ))),
+                                false
+                            ),
+                            result_agg_phy_exprs.field().unwrap()
+                        );
+                    }
                     _ => {}
                 };
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_agg_approx_percentile_phy_expr() {
+        for data_type in NUMERICS {
+            let input_schema =
+                Schema::new(vec![Field::new("c1", data_type.clone(), true)]);
+            let input_phy_exprs: Vec<Arc<dyn PhysicalExpr>> = vec![
+                Arc::new(
+                    expressions::Column::new_with_schema("c1", &input_schema).unwrap(),
+                ),
+                Arc::new(expressions::Literal::new(ScalarValue::Float64(Some(0.2)))),
+            ];
+            let result_agg_phy_exprs = create_aggregate_expr(
+                &AggregateFunction::ApproxPercentileCont,
+                false,
+                &input_phy_exprs[..],
+                &input_schema,
+                "c1",
+            )
+            .expect("failed to create aggregate expr");
+
+            assert!(result_agg_phy_exprs.as_any().is::<ApproxPercentileCont>());
+            assert_eq!("c1", result_agg_phy_exprs.name());
+            assert_eq!(
+                Field::new("c1", data_type.clone(), false),
+                result_agg_phy_exprs.field().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn test_agg_approx_percentile_invalid_phy_expr() {
+        for data_type in NUMERICS {
+            let input_schema =
+                Schema::new(vec![Field::new("c1", data_type.clone(), true)]);
+            let input_phy_exprs: Vec<Arc<dyn PhysicalExpr>> = vec![
+                Arc::new(
+                    expressions::Column::new_with_schema("c1", &input_schema).unwrap(),
+                ),
+                Arc::new(expressions::Literal::new(ScalarValue::Float64(Some(4.2)))),
+            ];
+            let err = create_aggregate_expr(
+                &AggregateFunction::ApproxPercentileCont,
+                false,
+                &input_phy_exprs[..],
+                &input_schema,
+                "c1",
+            )
+            .expect_err("should fail due to invalid percentile");
+
+            assert!(matches!(err, DataFusionError::Plan(_)));
+        }
     }
 
     #[test]

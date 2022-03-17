@@ -192,7 +192,7 @@ impl ExecutionPlan for CrossJoinExec {
             schema: self.schema.clone(),
             left_data,
             right: stream,
-            right_batch: Arc::new(std::sync::Mutex::new(None)),
+            right_batch: Arc::new(parking_lot::Mutex::new(None)),
             left_index: 0,
             num_input_batches: 0,
             num_input_rows: 0,
@@ -299,7 +299,7 @@ struct CrossJoinStream {
     /// Current value on the left
     left_index: usize,
     /// Current batch being processed from the right side
-    right_batch: Arc<std::sync::Mutex<Option<RecordBatch>>>,
+    right_batch: Arc<parking_lot::Mutex<Option<RecordBatch>>>,
     /// number of input batches
     num_input_batches: usize,
     /// number of input rows
@@ -331,8 +331,7 @@ fn build_batch(
             let scalar = ScalarValue::try_from_array(arr, left_index)?;
             Ok(scalar.to_array_of_size(batch.num_rows()))
         })
-        .collect::<Result<Vec<_>>>()
-        .map_err(|x| x.into_arrow_external_error())?;
+        .collect::<Result<Vec<_>>>()?;
 
     RecordBatch::try_new(
         Arc::new(schema.clone()),
@@ -355,7 +354,7 @@ impl Stream for CrossJoinStream {
         if self.left_index > 0 && self.left_index < self.left_data.num_rows() {
             let start = Instant::now();
             let right_batch = {
-                let right_batch = self.right_batch.lock().unwrap();
+                let right_batch = self.right_batch.lock();
                 right_batch.clone().unwrap()
             };
             let result =
@@ -390,7 +389,7 @@ impl Stream for CrossJoinStream {
                     }
                     self.left_index = 1;
 
-                    let mut right_batch = self.right_batch.lock().unwrap();
+                    let mut right_batch = self.right_batch.lock();
                     *right_batch = Some(batch);
 
                     Some(result)
