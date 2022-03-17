@@ -18,14 +18,14 @@
 //! Print format variants
 use arrow::csv::writer::WriterBuilder;
 use arrow::json::{ArrayWriter, LineDelimitedWriter};
+use core::fmt;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::pretty;
 use datafusion::error::{DataFusionError, Result};
-use std::fmt;
 use std::str::FromStr;
 
 /// Allow records to be printed in different formats
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, clap::ArgEnum, Clone)]
 pub enum PrintFormat {
     Csv,
     Tsv,
@@ -45,20 +45,6 @@ pub fn all_print_formats() -> Vec<PrintFormat> {
     ]
 }
 
-impl FromStr for PrintFormat {
-    type Err = ();
-    fn from_str(s: &str) -> std::result::Result<Self, ()> {
-        match s.to_lowercase().as_str() {
-            "csv" => Ok(Self::Csv),
-            "tsv" => Ok(Self::Tsv),
-            "table" => Ok(Self::Table),
-            "json" => Ok(Self::Json),
-            "ndjson" => Ok(Self::NdJson),
-            _ => Err(()),
-        }
-    }
-}
-
 impl fmt::Display for PrintFormat {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
@@ -68,6 +54,14 @@ impl fmt::Display for PrintFormat {
             Self::Json => write!(f, "json"),
             Self::NdJson => write!(f, "ndjson"),
         }
+    }
+}
+
+impl FromStr for PrintFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        clap::ArgEnum::from_str(s, true)
     }
 }
 
@@ -120,39 +114,8 @@ mod tests {
     use super::*;
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::from_slice::FromSlice;
     use std::sync::Arc;
-
-    #[test]
-    fn test_from_str() {
-        let format = "csv".parse::<PrintFormat>().unwrap();
-        assert_eq!(PrintFormat::Csv, format);
-
-        let format = "tsv".parse::<PrintFormat>().unwrap();
-        assert_eq!(PrintFormat::Tsv, format);
-
-        let format = "json".parse::<PrintFormat>().unwrap();
-        assert_eq!(PrintFormat::Json, format);
-
-        let format = "ndjson".parse::<PrintFormat>().unwrap();
-        assert_eq!(PrintFormat::NdJson, format);
-
-        let format = "table".parse::<PrintFormat>().unwrap();
-        assert_eq!(PrintFormat::Table, format);
-    }
-
-    #[test]
-    fn test_to_str() {
-        assert_eq!("csv", PrintFormat::Csv.to_string());
-        assert_eq!("table", PrintFormat::Table.to_string());
-        assert_eq!("tsv", PrintFormat::Tsv.to_string());
-        assert_eq!("json", PrintFormat::Json.to_string());
-        assert_eq!("ndjson", PrintFormat::NdJson.to_string());
-    }
-
-    #[test]
-    fn test_from_str_failure() {
-        assert!("pretty".parse::<PrintFormat>().is_err());
-    }
 
     #[test]
     fn test_print_batches_with_sep() {
@@ -168,9 +131,9 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(Int32Array::from(vec![4, 5, 6])),
-                Arc::new(Int32Array::from(vec![7, 8, 9])),
+                Arc::new(Int32Array::from_slice(&[1, 2, 3])),
+                Arc::new(Int32Array::from_slice(&[4, 5, 6])),
+                Arc::new(Int32Array::from_slice(&[7, 8, 9])),
             ],
         )
         .unwrap();
@@ -198,9 +161,9 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(Int32Array::from(vec![4, 5, 6])),
-                Arc::new(Int32Array::from(vec![7, 8, 9])),
+                Arc::new(Int32Array::from_slice(&[1, 2, 3])),
+                Arc::new(Int32Array::from_slice(&[4, 5, 6])),
+                Arc::new(Int32Array::from_slice(&[7, 8, 9])),
             ],
         )
         .unwrap();

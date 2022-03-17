@@ -135,6 +135,7 @@ define_language! {
 
         "or" = Or([Id;2]),
         "and" = And([Id;2]),
+        "&" = BitwiseAnd([Id;2]),
         "=" = Eq([Id;2]),
         "<>" = NotEq([Id;2]),
         "<" = Lt([Id;2]),
@@ -737,6 +738,7 @@ impl<'a> PlanConverter<'a> {
                     Operator::RegexNotIMatch => TokomakLogicalPlan::RegexNotIMatch,
                     Operator::IsDistinctFrom => TokomakLogicalPlan::IsDistinctFrom,
                     Operator::IsNotDistinctFrom => TokomakLogicalPlan::IsNotDistinctFrom,
+                    Operator::BitwiseAnd => TokomakLogicalPlan::BitwiseAnd,
                 })([left, right])
             }
             Expr::Column(c) => TokomakLogicalPlan::Column(c.clone().into()),
@@ -1503,6 +1505,8 @@ impl<'a> TokomakPlanConverter<'a> {
                 TokomakLogicalPlan::RegexNotIMatch(ids) => self.to_binary_op(ids, Operator::RegexNotIMatch)?,
                 TokomakLogicalPlan::IsDistinctFrom(ids)=>self.to_binary_op(ids, Operator::IsNotDistinctFrom)?,
                 TokomakLogicalPlan::IsNotDistinctFrom(ids)=>self.to_binary_op(ids, Operator::IsNotDistinctFrom)?,
+                TokomakLogicalPlan::BitwiseAnd(ids)=>self.to_binary_op(ids, Operator::BitwiseAnd)?,
+
                 TokomakLogicalPlan::Not(expr) => {
                     let l = self.convert_to_expr(expr[0])?;
                     Expr::Not(Box::new(l))
@@ -2115,6 +2119,7 @@ impl<'a> TokomakPlanConverter<'a> {
             | TokomakLogicalPlan::And(_)
             | TokomakLogicalPlan::Eq(_)
             | TokomakLogicalPlan::NotEq(_)
+            | TokomakLogicalPlan::BitwiseAnd(_)
             | TokomakLogicalPlan::Lt(_)
             | TokomakLogicalPlan::LtEq(_)
             | TokomakLogicalPlan::Gt(_)

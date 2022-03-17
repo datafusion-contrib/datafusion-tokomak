@@ -403,6 +403,7 @@ impl TokomakAnalysis {
             TokomakLogicalPlan::Multiply(b) => make_binop(Operator::Multiply, b),
             TokomakLogicalPlan::Divide(b) => make_binop(Operator::Divide, b),
             TokomakLogicalPlan::Modulus(b) => make_binop(Operator::Modulo, b),
+            TokomakLogicalPlan::BitwiseAnd(b) => make_binop(Operator::BitwiseAnd, b),
             TokomakLogicalPlan::Or(_)
             | TokomakLogicalPlan::And(_)
             | TokomakLogicalPlan::Eq(_)
@@ -979,6 +980,7 @@ impl CostFunction<TokomakLogicalPlan> for DefaultCostFunc {
             | TokomakLogicalPlan::RegexNotIMatch(_)
             | TokomakLogicalPlan::IsDistinctFrom(_)
             | TokomakLogicalPlan::IsNotDistinctFrom(_)
+            | TokomakLogicalPlan::BitwiseAnd(_)
             | TokomakLogicalPlan::Not(_)
             | TokomakLogicalPlan::IsNotNull(_)
             | TokomakLogicalPlan::IsNull(_)

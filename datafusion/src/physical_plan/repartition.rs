@@ -416,7 +416,7 @@ impl RepartitionExec {
             Err(e) => {
                 for (_, tx) in txs {
                     let err = DataFusionError::Execution(format!("Join Error: {}", e));
-                    let err = Err(err.into_arrow_external_error());
+                    let err = Err(err.into());
                     tx.send(Some(err)).ok();
                 }
             }
@@ -425,7 +425,7 @@ impl RepartitionExec {
                 for (_, tx) in txs {
                     // wrap it because need to send error to all output partitions
                     let err = DataFusionError::Execution(e.to_string());
-                    let err = Err(err.into_arrow_external_error());
+                    let err = Err(err.into());
                     tx.send(Some(err)).ok();
                 }
             }
@@ -447,7 +447,7 @@ struct RepartitionStream {
     /// Number of input partitions that have finished sending batches to this output channel
     num_input_partitions_processed: usize,
 
-    /// Schema
+    /// Schema wrapped by Arc
     schema: SchemaRef,
 
     /// channel containing the repartitioned batches
@@ -492,9 +492,9 @@ impl RecordBatchStream for RepartitionStream {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use super::*;
+    use crate::from_slice::FromSlice;
+    use crate::test::create_vec_batches;
     use crate::{
         assert_batches_sorted_eq,
         physical_plan::{collect, expressions::col, memory::MemoryExec},
@@ -509,10 +509,11 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use arrow::{
-        array::{ArrayRef, StringArray, UInt32Array},
+        array::{ArrayRef, StringArray},
         error::ArrowError,
     };
     use futures::FutureExt;
+    use std::collections::HashSet;
 
     #[tokio::test]
     async fn one_to_many_round_robin() -> Result<()> {
@@ -601,23 +602,6 @@ mod tests {
         Arc::new(Schema::new(vec![Field::new("c0", DataType::UInt32, false)]))
     }
 
-    fn create_vec_batches(schema: &Arc<Schema>, n: usize) -> Vec<RecordBatch> {
-        let batch = create_batch(schema);
-        let mut vec = Vec::with_capacity(n);
-        for _ in 0..n {
-            vec.push(batch.clone());
-        }
-        vec
-    }
-
-    fn create_batch(schema: &Arc<Schema>) -> RecordBatch {
-        RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(UInt32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8]))],
-        )
-        .unwrap()
-    }
-
     async fn repartition(
         schema: &SchemaRef,
         input_partitions: Vec<Vec<RecordBatch>>,
@@ -676,7 +660,7 @@ mod tests {
         // have to send at least one batch through to provoke error
         let batch = RecordBatch::try_from_iter(vec![(
             "my_awesome_field",
-            Arc::new(StringArray::from(vec!["foo", "bar"])) as ArrayRef,
+            Arc::new(StringArray::from_slice(&["foo", "bar"])) as ArrayRef,
         )])
         .unwrap();
 
@@ -733,7 +717,7 @@ mod tests {
         let runtime = Arc::new(RuntimeEnv::default());
         let batch = RecordBatch::try_from_iter(vec![(
             "my_awesome_field",
-            Arc::new(StringArray::from(vec!["foo", "bar"])) as ArrayRef,
+            Arc::new(StringArray::from_slice(&["foo", "bar"])) as ArrayRef,
         )])
         .unwrap();
 
@@ -767,13 +751,13 @@ mod tests {
         let runtime = Arc::new(RuntimeEnv::default());
         let batch1 = RecordBatch::try_from_iter(vec![(
             "my_awesome_field",
-            Arc::new(StringArray::from(vec!["foo", "bar"])) as ArrayRef,
+            Arc::new(StringArray::from_slice(&["foo", "bar"])) as ArrayRef,
         )])
         .unwrap();
 
         let batch2 = RecordBatch::try_from_iter(vec![(
             "my_awesome_field",
-            Arc::new(StringArray::from(vec!["frob", "baz"])) as ArrayRef,
+            Arc::new(StringArray::from_slice(&["frob", "baz"])) as ArrayRef,
         )])
         .unwrap();
 
@@ -920,25 +904,25 @@ mod tests {
     fn make_barrier_exec() -> BarrierExec {
         let batch1 = RecordBatch::try_from_iter(vec![(
             "my_awesome_field",
-            Arc::new(StringArray::from(vec!["foo", "bar"])) as ArrayRef,
+            Arc::new(StringArray::from_slice(&["foo", "bar"])) as ArrayRef,
         )])
         .unwrap();
 
         let batch2 = RecordBatch::try_from_iter(vec![(
             "my_awesome_field",
-            Arc::new(StringArray::from(vec!["frob", "baz"])) as ArrayRef,
+            Arc::new(StringArray::from_slice(&["frob", "baz"])) as ArrayRef,
         )])
         .unwrap();
 
         let batch3 = RecordBatch::try_from_iter(vec![(
             "my_awesome_field",
-            Arc::new(StringArray::from(vec!["goo", "gar"])) as ArrayRef,
+            Arc::new(StringArray::from_slice(&["goo", "gar"])) as ArrayRef,
         )])
         .unwrap();
 
         let batch4 = RecordBatch::try_from_iter(vec![(
             "my_awesome_field",
-            Arc::new(StringArray::from(vec!["grob", "gaz"])) as ArrayRef,
+            Arc::new(StringArray::from_slice(&["grob", "gaz"])) as ArrayRef,
         )])
         .unwrap();
 
@@ -976,7 +960,7 @@ mod tests {
         let runtime = Arc::new(RuntimeEnv::default());
         let batch = RecordBatch::try_from_iter(vec![(
             "a",
-            Arc::new(StringArray::from(vec!["foo"])) as ArrayRef,
+            Arc::new(StringArray::from_slice(&["foo"])) as ArrayRef,
         )])
         .unwrap();
         let partitioning = Partitioning::Hash(
